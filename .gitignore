@@ -1,0 +1,32 @@
+# ESP-IDF build output
+/build/
+sdkconfig.old
+
+# OS
+.DS_Store
+Thumbs.db
+
+# C/C++ build artifacts
+*.o
+*.obj
+*.d
+*.crf
+*.lst
+*.htm
+*.map
+*.lnp
+*.sct
+*.dep
+*.axf
+*.dbgconf
+*.build_log.htm
+
+# Editor temp / backup files
+*~
+*.TMP
+*.uvguix.*
+
+# Keil MDK generated output dirs
+TFT-147-HSD-ST7789-4WSPI-STM32/Progect/Objects/
+TFT-147-HSD-ST7789-4WSPI-STM32/Progect/Listings/
+TFT-147-HSD-ST7789-4WSPI-STM32/Progect/DebugConfig/

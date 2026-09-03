@@ -1,0 +1,20 @@
+{
+  "idf.currentSetup": "C:\\esp\\v6.0\\esp-idf",
+  "idf.portWin": "COM38",
+  "idf.flashType": "UART",
+  "idf.customExtraVars": {
+    "IDF_PATH": "C:\\esp\\v6.0\\esp-idf",
+    "IDF_TOOLS_PATH": "C:\\Espressif\\tools",
+    "IDF_PYTHON_ENV_PATH": "C:\\Espressif\\tools\\python\\v6.0\\venv",
+    "ESP_IDF_VERSION": "6.0.0",
+    "IDF_COMPONENT_LOCAL_STORAGE_URL": "file://C:\\Espressif\\tools\\",
+    "OPENOCD_SCRIPTS": "C:\\Espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20251215\\openocd-esp32\\share\\openocd\\scripts",
+    "ESP_ROM_ELF_DIR": "C:\\Espressif\\tools\\esp-rom-elfs\\20241011"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\XC\\2026\\hardwear\\ESP32C5-LCD147\\build"
+  ]
+}
