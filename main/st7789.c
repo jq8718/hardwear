@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -16,7 +17,7 @@
 #define PIN_BLK  26
 
 #define LCD_HOST     SPI2_HOST
-#define LCD_SPI_FREQ 20000000
+#define LCD_SPI_FREQ 40000000
 
 #define COLUMN_OFFSET 34
 #define CELL_SIZE     20
@@ -256,4 +257,142 @@ void st7789_draw_color_checkerboard(void)
     }
 
     gpio_set_level(PIN_CS, 1);
+}
+
+#define FONT_WIDTH  5
+#define FONT_HEIGHT 7
+
+static const uint8_t font_space[FONT_WIDTH] = {0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t font_minus[FONT_WIDTH] = {0x08, 0x08, 0x08, 0x08, 0x08};
+static const uint8_t font_colon[FONT_WIDTH] = {0x00, 0x00, 0x22, 0x00, 0x00};
+static const uint8_t font_0[FONT_WIDTH] = {0x3E, 0x41, 0x41, 0x41, 0x3E};
+static const uint8_t font_1[FONT_WIDTH] = {0x00, 0x42, 0x7F, 0x40, 0x00};
+static const uint8_t font_2[FONT_WIDTH] = {0x42, 0x61, 0x51, 0x49, 0x46};
+static const uint8_t font_3[FONT_WIDTH] = {0x22, 0x41, 0x49, 0x49, 0x36};
+static const uint8_t font_4[FONT_WIDTH] = {0x18, 0x14, 0x12, 0x7F, 0x10};
+static const uint8_t font_5[FONT_WIDTH] = {0x27, 0x45, 0x45, 0x45, 0x39};
+static const uint8_t font_6[FONT_WIDTH] = {0x3E, 0x49, 0x49, 0x49, 0x32};
+static const uint8_t font_7[FONT_WIDTH] = {0x01, 0x71, 0x09, 0x05, 0x03};
+static const uint8_t font_8[FONT_WIDTH] = {0x36, 0x49, 0x49, 0x49, 0x36};
+static const uint8_t font_9[FONT_WIDTH] = {0x26, 0x49, 0x49, 0x49, 0x3E};
+static const uint8_t font_E[FONT_WIDTH] = {0x7F, 0x49, 0x49, 0x49, 0x41};
+static const uint8_t font_N[FONT_WIDTH] = {0x7F, 0x02, 0x04, 0x08, 0x7F};
+static const uint8_t font_C[FONT_WIDTH] = {0x3E, 0x41, 0x41, 0x41, 0x22};
+static const uint8_t font_A[FONT_WIDTH] = {0x7E, 0x09, 0x09, 0x09, 0x7E};
+static const uint8_t font_R[FONT_WIDTH] = {0x7F, 0x09, 0x19, 0x29, 0x46};
+static const uint8_t font_W[FONT_WIDTH] = {0x3F, 0x40, 0x38, 0x40, 0x3F};
+
+static const uint8_t *font_glyph(char c)
+{
+    switch (c) {
+    case ' ': return font_space;
+    case '-': return font_minus;
+    case ':': return font_colon;
+    case '0': return font_0;
+    case '1': return font_1;
+    case '2': return font_2;
+    case '3': return font_3;
+    case '4': return font_4;
+    case '5': return font_5;
+    case '6': return font_6;
+    case '7': return font_7;
+    case '8': return font_8;
+    case '9': return font_9;
+    case 'E': return font_E;
+    case 'N': return font_N;
+    case 'C': return font_C;
+    case 'A': return font_A;
+    case 'R': return font_R;
+    case 'W': return font_W;
+    default: return font_space;
+    }
+}
+
+void st7789_fill_rect(int x, int y, int w, int h, uint16_t color)
+{
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > ST7789_WIDTH) {
+        w = ST7789_WIDTH - x;
+    }
+    if (y + h > ST7789_HEIGHT) {
+        h = ST7789_HEIGHT - y;
+    }
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+
+    st7789_set_window(x, y, x + w - 1, y + h - 1);
+
+    for (int i = 0; i < w; i++) {
+        s_row[i] = color;
+    }
+
+    gpio_set_level(PIN_DC, 1);
+    gpio_set_level(PIN_CS, 0);
+    for (int r = 0; r < h; r++) {
+        st7789_flush((const uint8_t *)s_row, (size_t)w * 2);
+    }
+    gpio_set_level(PIN_CS, 1);
+}
+
+void st7789_draw_text(const char *text, int x, int y, uint16_t fg, uint16_t bg, int scale)
+{
+    int chars = (int)strlen(text);
+    if (chars == 0) {
+        return;
+    }
+
+    int char_step = (FONT_WIDTH + 1) * scale;
+    int str_w = chars * char_step;
+    int str_h = FONT_HEIGHT * scale;
+
+    st7789_set_window(x, y, x + str_w - 1, y + str_h - 1);
+
+    gpio_set_level(PIN_DC, 1);
+    gpio_set_level(PIN_CS, 0);
+
+    // Stream the whole string in one continuous write: one row at a time,
+    // each glyph row repeated `scale` times vertically.
+    for (int r = 0; r < FONT_HEIGHT; r++) {
+        for (int sy = 0; sy < scale; sy++) {
+            int n = 0;
+            for (int i = 0; i < chars; i++) {
+                const uint8_t *glyph = font_glyph(text[i]);
+                for (int c = 0; c < FONT_WIDTH; c++) {
+                    uint16_t color = (glyph[c] & (1 << r)) ? fg : bg;
+                    for (int sx = 0; sx < scale; sx++) {
+                        s_row[n++] = color;
+                    }
+                }
+                for (int sp = 0; sp < scale; sp++) {
+                    s_row[n++] = bg;
+                }
+            }
+            st7789_flush((const uint8_t *)s_row, (size_t)n * 2);
+        }
+    }
+
+    gpio_set_level(PIN_CS, 1);
+}
+
+void st7789_draw_number(int value, int x, int y, uint16_t fg, uint16_t bg, int scale, int max_chars)
+{
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%-*d", max_chars, value);
+    st7789_draw_text(buf, x, y, fg, bg, scale);
+}
+
+void st7789_draw_label_number(const char *label, int value, int x, int y,
+                              uint16_t fg, uint16_t bg, int scale, int max_chars)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%s%-*d", label, max_chars, value);
+    st7789_draw_text(buf, x, y, fg, bg, scale);
 }

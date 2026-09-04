@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "encoder.h"
 #include "st7789.h"
 #include "ws2812_encoder.h"
 
@@ -15,7 +16,44 @@
 #define WS2812_FRAME_DELAY_MS   20
 #define WS2812_BRIGHTNESS       32
 
+#define COLOR_BG       0x0000
+#define COLOR_ENC1     0x07E0
+#define COLOR_ENC2     0x07FF
+#define COLOR_RAW      0xFFE0
+#define COLOR_ACC      0xFFFF
+#define COLOR_DIVIDER  0x39E7
+
+#define TEXT_SCALE     2
+#define RAW_MAX_CHARS  6
+#define ACC_MAX_CHARS  9
+
+#define TEXT_X 10
+
+#define ENC1_LABEL_Y 10
+#define ENC1_RAW_Y   46
+#define ENC1_ACC_Y   82
+#define DIVIDER_Y    150
+
+#define ENC2_LABEL_Y 166
+#define ENC2_RAW_Y   202
+#define ENC2_ACC_Y   238
+
 static const char *TAG = "ws2812";
+
+static void draw_encoder_layout(void)
+{
+    st7789_fill_screen(COLOR_BG);
+
+    st7789_draw_text("ENC1", TEXT_X, ENC1_LABEL_Y, COLOR_ENC1, COLOR_BG, TEXT_SCALE);
+    st7789_draw_label_number("RAW ", 0, TEXT_X, ENC1_RAW_Y, COLOR_RAW, COLOR_BG, TEXT_SCALE, RAW_MAX_CHARS);
+    st7789_draw_label_number("ACC ", 0, TEXT_X, ENC1_ACC_Y, COLOR_ACC, COLOR_BG, TEXT_SCALE, ACC_MAX_CHARS);
+
+    st7789_fill_rect(0, DIVIDER_Y, ST7789_WIDTH, 2, COLOR_DIVIDER);
+
+    st7789_draw_text("ENC2", TEXT_X, ENC2_LABEL_Y, COLOR_ENC2, COLOR_BG, TEXT_SCALE);
+    st7789_draw_label_number("RAW ", 0, TEXT_X, ENC2_RAW_Y, COLOR_RAW, COLOR_BG, TEXT_SCALE, RAW_MAX_CHARS);
+    st7789_draw_label_number("ACC ", 0, TEXT_X, ENC2_ACC_Y, COLOR_ACC, COLOR_BG, TEXT_SCALE, ACC_MAX_CHARS);
+}
 
 static void hsv_to_rgb(uint16_t hue, uint8_t *red, uint8_t *green, uint8_t *blue)
 {
@@ -91,8 +129,14 @@ void app_main(void)
     ESP_LOGI(TAG, "WS2812 rainbow started on GPIO%d", WS2812_GPIO);
 
     ESP_ERROR_CHECK(st7789_init());
-    st7789_draw_color_checkerboard();
-    ESP_LOGI(TAG, "LCD color checkerboard drawn");
+    ESP_ERROR_CHECK(encoder_init());
+    draw_encoder_layout();
+    ESP_LOGI(TAG, "LCD encoder display ready");
+
+    int last_raw1 = 0;
+    int last_acc1 = 0;
+    int last_raw2 = 0;
+    int last_acc2 = 0;
 
     while (true) {
         uint8_t red;
@@ -107,6 +151,33 @@ void app_main(void)
                                      &transmit_config));
         ESP_ERROR_CHECK(rmt_tx_wait_all_done(channel, portMAX_DELAY));
         hue = (hue + WS2812_RAINBOW_STEP) % 360;
+
+        int raw1 = encoder1_get_raw();
+        int acc1 = encoder1_get_count();
+        int raw2 = encoder2_get_raw();
+        int acc2 = encoder2_get_count();
+
+        if (raw1 != last_raw1) {
+            st7789_draw_label_number("RAW ", raw1, TEXT_X, ENC1_RAW_Y,
+                                     COLOR_RAW, COLOR_BG, TEXT_SCALE, RAW_MAX_CHARS);
+            last_raw1 = raw1;
+        }
+        if (acc1 != last_acc1) {
+            st7789_draw_label_number("ACC ", acc1, TEXT_X, ENC1_ACC_Y,
+                                     COLOR_ACC, COLOR_BG, TEXT_SCALE, ACC_MAX_CHARS);
+            last_acc1 = acc1;
+        }
+        if (raw2 != last_raw2) {
+            st7789_draw_label_number("RAW ", raw2, TEXT_X, ENC2_RAW_Y,
+                                     COLOR_RAW, COLOR_BG, TEXT_SCALE, RAW_MAX_CHARS);
+            last_raw2 = raw2;
+        }
+        if (acc2 != last_acc2) {
+            st7789_draw_label_number("ACC ", acc2, TEXT_X, ENC2_ACC_Y,
+                                     COLOR_ACC, COLOR_BG, TEXT_SCALE, ACC_MAX_CHARS);
+            last_acc2 = acc2;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(WS2812_FRAME_DELAY_MS));
     }
 }

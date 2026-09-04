@@ -1,19 +1,48 @@
 # ESP32-C5 LCD147
 
-这是 ESP32-C5 N16R8 的 ESP-IDF 工程。当前第一步先驱动 LCD147 上的 WS2812：程序启动后通过 `GPIO27` 发送 GRB 数据，让单颗 LED 以低亮度循环显示彩虹色。目录中的 `TFT-147-HSD-ST7789-4WSPI-STM32` 是后续 LCD 移植使用的 STM32F103 参考工程。
+这是 ESP32-C5 N16R8 的 ESP-IDF 工程，目前实现三部分功能：
+
+1. **WS2812 彩灯**：`GPIO27` 通过 RMT 发送 GRB 数据，单颗 LED 以低亮度循环彩虹色。
+2. **ST7789 液晶**：4 线 SPI（40 MHz）驱动 172x320 的 LCD147，背光由 `GPIO26` 控制。
+3. **两个旋转编码器**：编码器 1（`GPIO0/1`）、编码器 2（`GPIO4/5`）用 PCNT 正交解码（4 倍频），16 位原始计数与 32 位累加计数实时显示在 LCD 上。
+
+目录中的 `TFT-147-HSD-ST7789-4WSPI-STM32` 是 LCD 移植参考的 STM32F103 工程。
 
 **编译方案复用**：跨 ESP-IDF 项目可复用的完整编译/烧录/监视脚本见下文「从 Git Bash / MSys 终端编译」一节——尤其注意其中清除 `MSYSTEM` 环境变量的步骤，否则 `idf.py` 在 Git Bash/MSys 下会静默退出（看似成功、实际未编译）。
 
-## 当前点灯工程
+## 当前功能
+
+| 模块 | 配置 |
+|---|---|
+| 目标芯片 | ESP32-C5 N16R8 |
+| PSRAM | 8 MB，已启用并加入 `malloc()` 分配 |
+
+### WS2812 彩灯
 
 | 项目 | 配置 |
 |---|---|
-| 目标芯片 | ESP32-C5 |
 | WS2812 DIN | GPIO27 |
 | RMT 分辨率 | 10 MHz |
 | LED 颜色 | 低亮度彩虹循环，GRB 数据动态变化 |
 | LED 数量 | 1 |
-| PSRAM | 8 MB，已启用并加入 `malloc()` 分配 |
+
+### ST7789 液晶
+
+| 项目 | 配置 |
+|---|---|
+| 接口 | 4 线 SPI，40 MHz |
+| 分辨率 | 172 x 320（横向偏移 34） |
+| 背光 | GPIO26，高电平点亮 |
+| 内容 | 编码器计数实时显示 |
+
+### 旋转编码器
+
+| 项目 | 配置 |
+|---|---|
+| 编码器 1 | A=GPIO0，B=GPIO1 |
+| 编码器 2 | A=GPIO4，B=GPIO5 |
+| 解码方式 | PCNT 正交解码，4 倍频 |
+| 内部上拉 | 已启用（GPIO_PULLUP_ONLY） |
 
 接线时将 WS2812 的 `DIN` 接到 GPIO27，并共地。WS2812 的供电电压按实际模块规格连接；首次测试建议使用较低亮度，避免单颗 LED 电流过大。
 
@@ -160,7 +189,7 @@ $env:Path = "C:\Espressif\tools\riscv32-esp-elf\esp-15.2.0_20251204\riscv32-esp-
 
 上面的直接烧录命令只适用于 `build` 中的镜像来自本次工程、目标芯片为 ESP32-C5 且 Flash 配置为 16 MB 的情况。修改 `sdkconfig`、切换目标芯片或更换 ESP-IDF 版本后，必须先执行一次 `set-target` 和完整 `build`。
 
-退出串口监视器使用 `Ctrl+]`。烧录完成并重启后，GPIO27 上的 WS2812 应开始低亮度彩虹循环。
+退出串口监视器使用 `Ctrl+]`。烧录完成并重启后，GPIO27 上的 WS2812 开始低亮度彩虹循环，LCD 点亮并显示两个编码器的 RAW/ACC 计数。
 
 ## 编译验证
 
@@ -183,6 +212,9 @@ I (...) app_init: ESP-IDF:          v6.0-dirty
 I (...) esp_psram: Found 8MB PSRAM device
 I (...) ws2812: Memory: internal free=..., PSRAM total=..., PSRAM free=...
 I (...) ws2812: WS2812 rainbow started on GPIO27
+I (...) st7789: ST7789 initialized, backlight on
+I (...) encoder: encoders ready: enc1 GPIO0/1, enc2 GPIO4/5
+I (...) ws2812: LCD encoder display ready
 ```
 
 首次运行旧配置时，日志曾提示检测到 16 MB Flash 但镜像头声明为 2 MB。现已将 `CONFIG_ESPTOOLPY_FLASHSIZE` 改为 `16MB` 并重新编译烧录。监视器还曾因工具链目录未加入 `PATH` 而无法调用 `riscv32-esp-elf-addr2line`；启动日志本身不受影响，调试时应确保该工具的 `bin` 目录已加入 `PATH`。
@@ -203,4 +235,17 @@ I (...) ws2812: WS2812 rainbow started on GPIO27
 | VCC | 3.3 V |
 | GND | GND |
 
-LCD147 的有效区域为 `172x320`，ST7789 横向偏移为 `34`。LCD 驱动将在 WS2812 点灯验证完成后继续移植。
+LCD147 的有效区域为 `172x320`，ST7789 横向偏移为 `34`。LCD 驱动已移植，通过 4 线 SPI（40 MHz）点亮显示，背光由 GPIO26 控制。
+
+## 编码器参考接线
+
+两个旋转编码器通过 PCNT（脉冲计数器）正交解码驱动，A/B 相均启用内部上拉，旋转方向决定计数值增减，计数值实时显示在 LCD 上。
+
+| 编码器 | A 相 | B 相 |
+|---|---|---|
+| 编码器 1 | GPIO0 | GPIO1 |
+| 编码器 2 | GPIO4 | GPIO5 |
+
+- A/B 相内部上拉已启用（`GPIO_PULLUP_ONLY`），编码器公共端接 GND。
+- 每个编码器占用一个 PCNT 单元、两个通道做正交解码（`driver/pulse_cnt.h`），对 A/B 两相的 4 个跳变沿全部计数，即 4 倍频。PCNT 硬件计数寄存器为 16 位，回绕阈值 `low_limit/high_limit` 只能配置在 `-32768 ~ 32767`；开启 `accum_count` 后由中断做 32 位软件累加，`pcnt_unit_get_count()` 返回的累计值可达 32 位范围（约 ±21 亿），不会在 ±32767 处回绕。
+- LCD 上半区显示 `ENC1`（绿色标签）的 `RAW`（琥珀色，16 位原始计数）与 `ACC`（白色，32 位累加计数）；下半区显示 `ENC2`（青色标签）的 `RAW` 与 `ACC`，中间有分隔线。
