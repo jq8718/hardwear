@@ -40,7 +40,7 @@
 | CS | GPIO10 | 片选 |
 | BLK | GPIO26 | 背光，LEDC PWM 调光 |
 
-- 屏幕为 **172x320（或 320x172，按实际方向配置）** 的 ST7789 类 SPI 屏；使用 **SPI2_HOST**（不要用 SPI0/1）。
+- 屏幕为 **172x320（或 320x172，按实际方向配置）** 的 ST7789 类 SPI 屏；使用 **SPI2_HOST**（不要用 SPI0/1）。固件 v0.9.7 起逻辑坐标系为**横屏 320x172**（玻璃仍按 portrait 扫描，驱动用 PSRAM 全帧画布 + `st7789_commit()` 转置上屏，见 [vibekeyC5-firmware-plan.md](vibekeyC5-firmware-plan.md) 阶段5）。
 - 屏 VDD 接 3.3V；若屏 IO 需 1.8V 要加电平转换。
 
 ---

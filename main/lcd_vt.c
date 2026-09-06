@@ -14,10 +14,12 @@
 #include "st7789.h"
 #include "lcd_vt.h"
 
-#define ROW_STEP  8            /* FONT_HEIGHT 7 + 1 px line gap */
-#define X_MARGIN  1
-#define HEADER_H  14           /* px above the terminal area */
-#define TERM_Y    (HEADER_H + 1)
+#define LCD_SCALE 2             /* text is drawn at 2x */
+#define ROW_STEP  18            /* 8-row glyph at 2x (16 px) + 2 px gap */
+#define X_MARGIN  4
+#define HEADER_H  20            /* px above the terminal area */
+#define TERM_Y    (HEADER_H + 2)
+#define CHAR_W    ST7789_CHAR_W(LCD_SCALE)   /* 12 px per char at 2x */
 
 #define COL_BG     0x0000
 #define COL_FG     0xFFFF
@@ -411,24 +413,30 @@ void lcd_vt_set_status(lcd_vt_state_t st, const char *title)
 
 static void draw_header(void)
 {
-    st7789_fill_rect(0, 0, ST7789_WIDTH, HEADER_H, COL_BG);
+    uint16_t col = status_color();
+    /* whole band in the status color; text on it in black for contrast */
+    st7789_fill_rect(0, 0, ST7789_WIDTH, HEADER_H, col);
     st7789_fill_rect(0, HEADER_H - 2, ST7789_WIDTH, 2, COL_GRID);
 
-    uint16_t col = status_color();
-    /* label as a small solid square + text */
-    st7789_fill_rect(3, 4, 6, 6, col);
-    st7789_draw_text(status_label(), 12, 2, col, COL_BG, 1);
+    int label_x = 6;
+    st7789_draw_text(status_label(), label_x, 2, COL_BG, col, LCD_SCALE);
 
-    /* instance title, truncated to the right-hand space */
-    char line[LCDVT_COLS + 1];
-    int maxc = LCDVT_COLS - 14;               /* after "  LABEL" area */
-    size_t n = strlen(s_title);
-    if ((int) n > maxc) {
+    /* instance title, truncated to the space right of an 8-char label zone */
+    const int title_x = label_x + 8 * CHAR_W;      /* 102 */
+    int maxc = (ST7789_WIDTH - title_x - 4) / CHAR_W;
+    if (maxc < 1) {
+        maxc = 1;
+    }
+    int n = (int) strlen(s_title);
+    if (n > maxc) {
         n = maxc;
     }
-    memcpy(line, s_title, n);
-    line[n] = 0;
-    st7789_draw_text(line, 12 + 6 * 8, 2, COL_FG, COL_BG, 1);
+    if (n > 0) {
+        char line[LCDVT_COLS + 1];
+        memcpy(line, s_title, n);
+        line[n] = 0;
+        st7789_draw_text(line, title_x, 2, COL_BG, col, LCD_SCALE);
+    }
     s_header_dirty = false;
 }
 
@@ -444,26 +452,34 @@ static void draw_row(int r)
         n--;
     }
     int y = TERM_Y + r * ROW_STEP;
+    /* clear the whole grid row first so shrunk text leaves no ghost pixels */
+    st7789_fill_rect(X_MARGIN, y, LCDVT_COLS * CHAR_W,
+                     ST7789_FONT_H * LCD_SCALE, COL_BG);
     if (n > 0) {
         line[n] = 0;
-        st7789_draw_text(line, X_MARGIN, y, COL_FG, COL_BG, 1);
+        st7789_draw_text(line, X_MARGIN, y, COL_FG, COL_BG, LCD_SCALE);
     }
 }
 
 void lcd_vt_poll(void)
 {
+    bool need_commit = false;
     if (s_header_dirty) {
         draw_header();
+        need_commit = true;
     }
-    if (s_dirty == 0) {
-        return;
-    }
-    uint64_t mask = s_dirty;
-    s_dirty = 0;
-    for (int r = 0; r < LCDVT_ROWS; r++) {
-        if (mask & (1ULL << r)) {
-            draw_row(r);
+    if (s_dirty != 0) {
+        need_commit = true;
+        uint64_t mask = s_dirty;
+        s_dirty = 0;
+        for (int r = 0; r < LCDVT_ROWS; r++) {
+            if (mask & (1ULL << r)) {
+                draw_row(r);
+            }
         }
+    }
+    if (need_commit) {
+        st7789_commit();
     }
 }
 
@@ -476,4 +492,6 @@ void lcd_vt_init(void)
     st7789_fill_screen(COL_BG);
     s_header_dirty = true;
     lcd_vt_set_status(LCD_ST_BOOT, "VibeKey");
+    draw_header();
+    st7789_commit();
 }

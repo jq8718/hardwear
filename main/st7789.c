@@ -1,13 +1,16 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "st7789.h"
+#include "font5x7.h"
 
 #define PIN_MOSI 7
 #define PIN_SCLK 6
@@ -19,8 +22,16 @@
 #define LCD_HOST     SPI2_HOST
 #define LCD_SPI_FREQ 40000000
 
-#define COLUMN_OFFSET 34
-#define CELL_SIZE     20
+/* Physical panel geometry (the glass stays portrait 172x320). */
+#define NATIVE_W      172
+#define NATIVE_H      320
+#define NATIVE_OFFSET 34
+
+/* Landscape orientation of the canvas on the panel.
+ * Mapping used (ROT_FLIP=0): native row = logical x (so text reads along the
+ * long axis), native column = (NATIVE_W-1) - logical y. Set to 1 to rotate
+ * 180 degrees if the image comes up upside down on the bench. */
+#define ROT_FLIP 0
 
 #define RGB565(r, g, b) \
     ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | (((b) & 0xF8) >> 3)))
@@ -29,7 +40,8 @@ static const char *TAG = "st7789";
 
 static spi_device_handle_t s_spi = NULL;
 
-static uint16_t s_row[ST7789_WIDTH] __attribute__((aligned(4)));
+static uint16_t *s_fb;             /* canvas[320][172], [x*ST7789_HEIGHT + y] */
+static uint16_t s_row[NATIVE_W] __attribute__((aligned(4)));
 
 static void st7789_send_cmd(uint8_t cmd)
 {
@@ -82,17 +94,12 @@ static void st7789_send_data(const uint8_t *data, size_t len)
     gpio_set_level(PIN_CS, 1);
 }
 
-static void st7789_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
+static void st7789_flush(const uint8_t *data, size_t len)
 {
-    st7789_send_cmd(0x2A);
-    st7789_send_data16(x0 + COLUMN_OFFSET);
-    st7789_send_data16(x1 + COLUMN_OFFSET);
-
-    st7789_send_cmd(0x2B);
-    st7789_send_data16(y0);
-    st7789_send_data16(y1);
-
-    st7789_send_cmd(0x2C);
+    spi_transaction_t t = {0};
+    t.length = len * 8;
+    t.tx_buffer = data;
+    ESP_ERROR_CHECK(spi_device_transmit(s_spi, &t));
 }
 
 static void st7789_reset(void)
@@ -105,6 +112,16 @@ static void st7789_reset(void)
 
 esp_err_t st7789_init(void)
 {
+    s_fb = heap_caps_malloc(ST7789_WIDTH * ST7789_HEIGHT * sizeof(uint16_t),
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_fb) {
+        s_fb = malloc(ST7789_WIDTH * ST7789_HEIGHT * sizeof(uint16_t));
+    }
+    if (!s_fb) {
+        ESP_LOGE(TAG, "no memory for canvas (%d px)", ST7789_WIDTH * ST7789_HEIGHT);
+        return ESP_ERR_NO_MEM;
+    }
+
     gpio_config_t io = {
         .pin_bit_mask = (1ULL << PIN_CS) | (1ULL << PIN_DC) |
                         (1ULL << PIN_RST) | (1ULL << PIN_BLK),
@@ -126,7 +143,7 @@ esp_err_t st7789_init(void)
         .sclk_io_num = PIN_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = ST7789_WIDTH * 2,
+        .max_transfer_sz = NATIVE_W * 2,
         .flags = SPICOMMON_BUSFLAG_MASTER,
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
@@ -195,7 +212,9 @@ esp_err_t st7789_init(void)
     vTaskDelay(pdMS_TO_TICKS(120));
     st7789_send_cmd(0x29);              // display ON
 
-    ESP_LOGI(TAG, "ST7789 initialized, backlight on");
+    ESP_LOGI(TAG, "ST7789 canvas %dx%d initialized (%s), backlight on",
+             ST7789_WIDTH, ST7789_HEIGHT,
+             heap_caps_get_free_size(MALLOC_CAP_SPIRAM) ? "psram fb" : "internal fb");
     return ESP_OK;
 }
 
@@ -204,28 +223,47 @@ void st7789_set_backlight(bool on)
     gpio_set_level(PIN_BLK, on ? 1 : 0);
 }
 
-static void st7789_flush(const uint8_t *data, size_t len)
+void st7789_commit(void)
 {
-    spi_transaction_t t = {0};
-    t.length = len * 8;
-    t.tx_buffer = data;
-    ESP_ERROR_CHECK(spi_device_transmit(s_spi, &t));
+    if (!s_fb) {
+        return;
+    }
+    /* Paint the full native panel: set the window once (native cols +offset,
+     * all rows), then stream one native row at a time. Native row R corresponds
+     * to logical x = R; each native column C is logical y = NATIVE_W-1-C (or C
+     * when ROT_FLIP), giving the landscape transpose. */
+    st7789_send_cmd(0x2A);
+    st7789_send_data16(NATIVE_OFFSET);
+    st7789_send_data16(NATIVE_OFFSET + NATIVE_W - 1);
+    st7789_send_cmd(0x2B);
+    st7789_send_data16(0);
+    st7789_send_data16(NATIVE_H - 1);
+    st7789_send_cmd(0x2C);
+
+    gpio_set_level(PIN_DC, 1);
+    gpio_set_level(PIN_CS, 0);
+    for (int R = 0; R < NATIVE_H; R++) {
+        const uint16_t *fbrow = &s_fb[R * ST7789_HEIGHT];
+#if ROT_FLIP
+        memcpy(s_row, fbrow, sizeof(s_row));
+#else
+        for (int C = 0; C < NATIVE_W; C++) {
+            s_row[C] = fbrow[NATIVE_W - 1 - C];
+        }
+#endif
+        st7789_flush((const uint8_t *)s_row, sizeof(s_row));
+    }
+    gpio_set_level(PIN_CS, 1);
 }
 
 void st7789_fill_screen(uint16_t color)
 {
-    st7789_set_window(0, 0, ST7789_WIDTH - 1, ST7789_HEIGHT - 1);
-
-    for (int x = 0; x < ST7789_WIDTH; x++) {
-        s_row[x] = color;
+    if (!s_fb) {
+        return;
     }
-
-    gpio_set_level(PIN_DC, 1);
-    gpio_set_level(PIN_CS, 0);
-    for (int y = 0; y < ST7789_HEIGHT; y++) {
-        st7789_flush((const uint8_t *)s_row, sizeof(s_row));
+    for (size_t i = 0; i < (size_t)ST7789_WIDTH * ST7789_HEIGHT; i++) {
+        s_fb[i] = color;
     }
-    gpio_set_level(PIN_CS, 1);
 }
 
 void st7789_draw_color_checkerboard(void)
@@ -241,75 +279,21 @@ void st7789_draw_color_checkerboard(void)
         RGB565(255, 255, 255),
     };
     const int ncolors = sizeof(palette) / sizeof(palette[0]);
-
-    st7789_set_window(0, 0, ST7789_WIDTH - 1, ST7789_HEIGHT - 1);
-
-    gpio_set_level(PIN_DC, 1);
-    gpio_set_level(PIN_CS, 0);
-
+    const int cell = 20;
     for (int y = 0; y < ST7789_HEIGHT; y++) {
-        int cy = y / CELL_SIZE;
+        int cy = y / cell;
         for (int x = 0; x < ST7789_WIDTH; x++) {
-            int cx = x / CELL_SIZE;
-            s_row[x] = palette[(cx + cy) % ncolors];
+            int cx = x / cell;
+            s_fb[x * ST7789_HEIGHT + y] = palette[(cx + cy) % ncolors];
         }
-        st7789_flush((const uint8_t *)s_row, sizeof(s_row));
-    }
-
-    gpio_set_level(PIN_CS, 1);
-}
-
-#define FONT_WIDTH  5
-#define FONT_HEIGHT 7
-
-static const uint8_t font_space[FONT_WIDTH] = {0x00, 0x00, 0x00, 0x00, 0x00};
-static const uint8_t font_minus[FONT_WIDTH] = {0x08, 0x08, 0x08, 0x08, 0x08};
-static const uint8_t font_colon[FONT_WIDTH] = {0x00, 0x00, 0x22, 0x00, 0x00};
-static const uint8_t font_0[FONT_WIDTH] = {0x3E, 0x41, 0x41, 0x41, 0x3E};
-static const uint8_t font_1[FONT_WIDTH] = {0x00, 0x42, 0x7F, 0x40, 0x00};
-static const uint8_t font_2[FONT_WIDTH] = {0x42, 0x61, 0x51, 0x49, 0x46};
-static const uint8_t font_3[FONT_WIDTH] = {0x22, 0x41, 0x49, 0x49, 0x36};
-static const uint8_t font_4[FONT_WIDTH] = {0x18, 0x14, 0x12, 0x7F, 0x10};
-static const uint8_t font_5[FONT_WIDTH] = {0x27, 0x45, 0x45, 0x45, 0x39};
-static const uint8_t font_6[FONT_WIDTH] = {0x3E, 0x49, 0x49, 0x49, 0x32};
-static const uint8_t font_7[FONT_WIDTH] = {0x01, 0x71, 0x09, 0x05, 0x03};
-static const uint8_t font_8[FONT_WIDTH] = {0x36, 0x49, 0x49, 0x49, 0x36};
-static const uint8_t font_9[FONT_WIDTH] = {0x26, 0x49, 0x49, 0x49, 0x3E};
-static const uint8_t font_E[FONT_WIDTH] = {0x7F, 0x49, 0x49, 0x49, 0x41};
-static const uint8_t font_N[FONT_WIDTH] = {0x7F, 0x02, 0x04, 0x08, 0x7F};
-static const uint8_t font_C[FONT_WIDTH] = {0x3E, 0x41, 0x41, 0x41, 0x22};
-static const uint8_t font_A[FONT_WIDTH] = {0x7E, 0x09, 0x09, 0x09, 0x7E};
-static const uint8_t font_R[FONT_WIDTH] = {0x7F, 0x09, 0x19, 0x29, 0x46};
-static const uint8_t font_W[FONT_WIDTH] = {0x3F, 0x40, 0x38, 0x40, 0x3F};
-
-static const uint8_t *font_glyph(char c)
-{
-    switch (c) {
-    case ' ': return font_space;
-    case '-': return font_minus;
-    case ':': return font_colon;
-    case '0': return font_0;
-    case '1': return font_1;
-    case '2': return font_2;
-    case '3': return font_3;
-    case '4': return font_4;
-    case '5': return font_5;
-    case '6': return font_6;
-    case '7': return font_7;
-    case '8': return font_8;
-    case '9': return font_9;
-    case 'E': return font_E;
-    case 'N': return font_N;
-    case 'C': return font_C;
-    case 'A': return font_A;
-    case 'R': return font_R;
-    case 'W': return font_W;
-    default: return font_space;
     }
 }
 
 void st7789_fill_rect(int x, int y, int w, int h, uint16_t color)
 {
+    if (!s_fb) {
+        return;
+    }
     if (x < 0) {
         w += x;
         x = 0;
@@ -327,59 +311,66 @@ void st7789_fill_rect(int x, int y, int w, int h, uint16_t color)
     if (w <= 0 || h <= 0) {
         return;
     }
-
-    st7789_set_window(x, y, x + w - 1, y + h - 1);
-
-    for (int i = 0; i < w; i++) {
-        s_row[i] = color;
+    for (int yy = y; yy < y + h; yy++) {
+        uint16_t *rowp = &s_fb[x * ST7789_HEIGHT + yy];
+        for (int xx = 0; xx < w; xx++) {
+            rowp[xx * ST7789_HEIGHT] = color;
+        }
     }
+}
 
-    gpio_set_level(PIN_DC, 1);
-    gpio_set_level(PIN_CS, 0);
-    for (int r = 0; r < h; r++) {
-        st7789_flush((const uint8_t *)s_row, (size_t)w * 2);
+static const uint8_t *font_glyph(char c)
+{
+    int idx = (int)((unsigned char)c) - FONT_GLYPH_OFFSET;
+    if (idx < 0 || idx >= FONT_NUM_GLYPHS) {
+        idx = 0;   /* space */
     }
-    gpio_set_level(PIN_CS, 1);
+    return font5x7[idx];
 }
 
 void st7789_draw_text(const char *text, int x, int y, uint16_t fg, uint16_t bg, int scale)
 {
+    if (!s_fb) {
+        return;
+    }
+    if (scale < 1) {
+        scale = 1;
+    }
     int chars = (int)strlen(text);
     if (chars == 0) {
         return;
     }
+    int char_step = (ST7789_FONT_W + 1) * scale;
 
-    int char_step = (FONT_WIDTH + 1) * scale;
-    int str_w = chars * char_step;
-    int str_h = FONT_HEIGHT * scale;
-
-    st7789_set_window(x, y, x + str_w - 1, y + str_h - 1);
-
-    gpio_set_level(PIN_DC, 1);
-    gpio_set_level(PIN_CS, 0);
-
-    // Stream the whole string in one continuous write: one row at a time,
-    // each glyph row repeated `scale` times vertically.
-    for (int r = 0; r < FONT_HEIGHT; r++) {
+    for (int r = 0; r < ST7789_FONT_H; r++) {
         for (int sy = 0; sy < scale; sy++) {
-            int n = 0;
+            int yy = y + r * scale + sy;
+            if (yy < 0 || yy >= ST7789_HEIGHT) {
+                continue;
+            }
             for (int i = 0; i < chars; i++) {
                 const uint8_t *glyph = font_glyph(text[i]);
-                for (int c = 0; c < FONT_WIDTH; c++) {
+                for (int c = 0; c < ST7789_FONT_W; c++) {
                     uint16_t color = (glyph[c] & (1 << r)) ? fg : bg;
                     for (int sx = 0; sx < scale; sx++) {
-                        s_row[n++] = color;
+                        int xx = x + i * char_step + c * scale + sx;
+                        if (xx < 0 || xx >= ST7789_WIDTH) {
+                            continue;
+                        }
+                        s_fb[xx * ST7789_HEIGHT + yy] = color;
                     }
                 }
-                for (int sp = 0; sp < scale; sp++) {
-                    s_row[n++] = bg;
+                if ((x + i * char_step + ST7789_FONT_W * scale) < ST7789_WIDTH) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        int xx = x + i * char_step + ST7789_FONT_W * scale + sx;
+                        if (xx >= 0 && xx < ST7789_WIDTH) {
+                            s_fb[xx * ST7789_HEIGHT + yy] = bg;
+                        }
+                    }
                 }
             }
-            st7789_flush((const uint8_t *)s_row, (size_t)n * 2);
         }
     }
-
-    gpio_set_level(PIN_CS, 1);
 }
 
 void st7789_draw_number(int value, int x, int y, uint16_t fg, uint16_t bg, int scale, int max_chars)

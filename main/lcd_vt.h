@@ -9,9 +9,11 @@ extern "C" {
 #endif
 
 /* LCDVT_COLS/ROWS are also the PTY size vibetty is told to run the session at
- * (via the sync control), so the mirrored grid matches the panel exactly. */
-#define LCDVT_COLS 28
-#define LCDVT_ROWS 38
+ * (via the sync control), so the mirrored grid matches the panel exactly.
+ * Landscape 320x172 at 2x text: 26 cols of 12 px + margin, 8 rows in the
+ * body below the ~20 px status header. */
+#define LCDVT_COLS 26
+#define LCDVT_ROWS 8
 
 typedef enum {
     LCD_ST_BOOT = 0,
