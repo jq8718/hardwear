@@ -1,0 +1,381 @@
+//! `vibetty setup` —— TUI 配置 MQTT 传输,写入 `~/.vibetty/config.toml` 的 `[mqtt]` 段。
+//!
+//! 上下选择字段,Enter 进入编辑,字符直接输入(←/→ 移光标),`s` 保存,`q`/Esc 退出。
+//! 保存时把 `[mqtt]` 段写回 config.toml(保留文件里其它段)。
+
+use crossterm::{
+    event::{self, KeyCode, KeyEventKind},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::Line,
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+};
+use std::io::Stdout;
+
+use crate::config::MqttConfig;
+
+type Term = Terminal<CrosstermBackend<Stdout>>;
+
+fn config_path(override_path: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    match override_path {
+        Some(p) => Some(p.to_path_buf()),
+        None => dirs::home_dir().map(|h| h.join(".vibetty").join("config.toml")),
+    }
+}
+
+/// 读取现有 `[mqtt]` 段,用于预填表单。
+fn load_mqtt(override_path: Option<&std::path::Path>) -> Option<MqttConfig> {
+    let path = config_path(override_path)?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    #[derive(serde::Deserialize)]
+    struct Section {
+        #[serde(default)]
+        mqtt: Option<MqttConfig>,
+    }
+    toml::from_str::<Section>(&content).ok()?.mqtt
+}
+
+/// 把 `[mqtt]` 段写回 config.toml(默认 `~/.vibetty/config.toml`),保留文件中已有的其它段。
+pub(crate) fn save_mqtt(
+    mqtt: &MqttConfig,
+    override_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let path =
+        config_path(override_path).ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut table: toml::Table = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default();
+    table.insert("mqtt".to_string(), toml::Value::try_from(mqtt)?);
+    std::fs::write(&path, toml::to_string_pretty(&table)?)?;
+    Ok(())
+}
+
+struct Field {
+    label: &'static str,
+    value: String,
+    /// 文本/数值字段的光标位置(字节偏移,指向待插入点);bool 字段不用。
+    cursor: usize,
+    hint: &'static str,
+}
+
+fn fields_from(existing: Option<&MqttConfig>) -> Vec<Field> {
+    let e = existing.cloned();
+    // 字段构造助手:cursor 初始放到末尾(追加输入的最自然位置)。
+    let mk = |label: &'static str, value: String, hint: &'static str| {
+        let cursor = value.len();
+        Field {
+            label,
+            value,
+            cursor,
+            hint,
+        }
+    };
+    vec![
+        mk(
+            "enable",
+            e.as_ref()
+                .map(|c| c.enable.to_string())
+                .unwrap_or_else(|| "true".into()),
+            "[Space] toggle true / false",
+        ),
+        mk(
+            "broker",
+            e.as_ref().map(|c| c.broker.clone()).unwrap_or_default(),
+            "mqtt(s)://[user:pass@]host:port  (mqtts = TLS)",
+        ),
+        mk(
+            "builtin_port",
+            e.as_ref()
+                .map(|c| c.builtin_port.to_string())
+                .unwrap_or_else(|| "1883".into()),
+            "Built-in broker TCP port (default 1883)",
+        ),
+        mk(
+            "qos",
+            e.as_ref()
+                .map(|c| c.qos.to_string())
+                .unwrap_or_else(|| "1".into()),
+            "0 / 1 / 2, default 1",
+        ),
+        mk(
+            "keep_alive_secs",
+            e.as_ref()
+                .map(|c| c.keep_alive_secs.to_string())
+                .unwrap_or_else(|| "30".into()),
+            "Default 30",
+        ),
+        mk(
+            "builtin_broker",
+            e.as_ref()
+                .map(|c| c.builtin_broker.to_string())
+                .unwrap_or_else(|| "false".into()),
+            "[Space] toggle: spawn built-in rumqttd here (LAN)",
+        ),
+        mk(
+            "builtin_ws_port",
+            e.as_ref()
+                .map(|c| c.builtin_ws_port.to_string())
+                .unwrap_or_else(|| "9001".into()),
+            "Built-in broker WS port (default 9001)",
+        ),
+    ]
+}
+
+fn field<'a>(fields: &'a [Field], label: &str) -> &'a Field {
+    fields
+        .iter()
+        .find(|f| f.label == label)
+        .expect("MQTT field always present")
+}
+
+/// 由表单字段构建 `MqttConfig`;host 必填(除非 builtin_broker=true),数值/枚举字段非法时报错。
+fn mqtt_from_fields(fields: &[Field]) -> anyhow::Result<MqttConfig> {
+    let enable = match field(fields, "enable").value.trim() {
+        "" | "true" | "1" => true,
+        "false" | "0" => false,
+        s => anyhow::bail!("invalid enable: {s} (true / false)"),
+    };
+    let builtin_broker = match field(fields, "builtin_broker").value.trim() {
+        "" | "false" | "0" => false,
+        "true" | "1" => true,
+        s => anyhow::bail!("invalid builtin_broker: {s} (true / false)"),
+    };
+    let broker = field(fields, "broker").value.trim().to_string();
+    // 内置 broker 模式下 broker 会被覆盖成 mqtt://127.0.0.1:port,所以不强制填。
+    if enable && !builtin_broker && broker.is_empty() {
+        anyhow::bail!("broker URL is required when enable=true and builtin_broker=false");
+    }
+    let builtin_port = parse_or(field(fields, "builtin_port"), 1883)?;
+    let qos = parse_or(field(fields, "qos"), 1)?;
+    let keep_alive_secs = parse_or(field(fields, "keep_alive_secs"), 30)?;
+    let builtin_ws_port = parse_or(field(fields, "builtin_ws_port"), 9001)?;
+    Ok(MqttConfig {
+        enable,
+        broker,
+        builtin_port,
+        qos,
+        keep_alive_secs,
+        builtin_broker,
+        builtin_ws_port,
+    })
+}
+
+fn parse_or<T: std::str::FromStr>(fld: &Field, default: T) -> anyhow::Result<T> {
+    let raw = fld.value.trim();
+    if raw.is_empty() {
+        return Ok(default);
+    }
+    raw.parse::<T>()
+        .map_err(|_| anyhow::anyhow!("cannot parse {}: {raw}", fld.label))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Select,
+    Edit,
+}
+
+pub fn run_setup(config: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let override_path = config.as_deref();
+    let existing = load_mqtt(override_path);
+    let mut fields = fields_from(existing.as_ref());
+    let mut state = ListState::default();
+    state.select(Some(0));
+    let mut mode = Mode::Select;
+    let mut status: Option<String> = None;
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = setup_loop(
+        &mut terminal,
+        &mut fields,
+        &mut state,
+        &mut mode,
+        &mut status,
+        override_path,
+    );
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn setup_loop(
+    terminal: &mut Term,
+    fields: &mut [Field],
+    state: &mut ListState,
+    mode: &mut Mode,
+    status: &mut Option<String>,
+    override_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    loop {
+        terminal.draw(|f| draw(f, fields, state, *mode, status.as_deref()))?;
+
+        if !event::poll(std::time::Duration::from_millis(100))? {
+            continue;
+        }
+        let event::Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        // 保存/出错后,任意键退出。
+        if status.is_some() {
+            return Ok(());
+        }
+
+        match mode {
+            Mode::Select => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('s') => match mqtt_from_fields(fields) {
+                    Ok(cfg) => match save_mqtt(&cfg, override_path) {
+                        Ok(()) => {
+                            let p = config_path(override_path)
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default();
+                            *status = Some(format!("Saved to {p}. Press any key to exit."));
+                        }
+                        Err(e) => *status = Some(format!("Save failed: {e}")),
+                    },
+                    Err(e) => *status = Some(format!("Invalid input: {e}")),
+                },
+                KeyCode::Up => state.select_previous(),
+                KeyCode::Down => state.select_next(),
+                KeyCode::Enter => *mode = Mode::Edit,
+                _ => {}
+            },
+            Mode::Edit => {
+                let Some(i) = state.selected() else {
+                    *mode = Mode::Select;
+                    continue;
+                };
+                let is_bool = matches!(fields[i].label, "enable" | "builtin_broker");
+                let f = &mut fields[i];
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => *mode = Mode::Select,
+                    // bool 字段:按键切换,不逐字输入(无光标移动)
+                    KeyCode::Char(' ') if is_bool => {
+                        f.value = if f.value.trim() == "true" {
+                            "false"
+                        } else {
+                            "true"
+                        }
+                        .to_string();
+                    }
+                    KeyCode::Char('t') | KeyCode::Char('T') if is_bool => {
+                        f.value = "true".to_string();
+                    }
+                    KeyCode::Char('f') | KeyCode::Char('F') if is_bool => {
+                        f.value = "false".to_string();
+                    }
+                    // 文本/数值字段:←/→ 移光标,Home/End 跳首尾
+                    KeyCode::Left if !is_bool => f.cursor = f.cursor.saturating_sub(1),
+                    KeyCode::Right if !is_bool => f.cursor = (f.cursor + 1).min(f.value.len()),
+                    KeyCode::Home if !is_bool => f.cursor = 0,
+                    KeyCode::End if !is_bool => f.cursor = f.value.len(),
+                    // Backspace 删光标前一个字符;Delete 删光标所在字符
+                    KeyCode::Backspace if !is_bool => {
+                        if f.cursor > 0 {
+                            f.cursor -= 1;
+                            f.value.remove(f.cursor);
+                        }
+                    }
+                    KeyCode::Delete if !is_bool => {
+                        if f.cursor < f.value.len() {
+                            f.value.remove(f.cursor);
+                        }
+                    }
+                    KeyCode::Char(c) if !is_bool => {
+                        f.value.insert(f.cursor, c);
+                        f.cursor += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn draw(f: &mut Frame, fields: &[Field], state: &mut ListState, mode: Mode, status: Option<&str>) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(f.area());
+
+    let title = Paragraph::new("Vibetty — MQTT setup  (~/.vibetty/config.toml)")
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(title, chunks[0]);
+
+    let items: Vec<ListItem<'_>> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, fld)| {
+            let sel = state.selected() == Some(i);
+            let editing = sel && mode == Mode::Edit;
+            let is_bool = matches!(fld.label, "enable" | "builtin_broker");
+            let val = if editing && is_bool {
+                format!("[{}]", fld.value)
+            } else if editing {
+                // 把光标块 ▌ 插到 cursor 位置,直观显示插入点。
+                let mut s = fld.value.clone();
+                s.insert(fld.cursor.min(s.len()), '▌');
+                s
+            } else if fld.value.is_empty() {
+                "(empty)".to_string()
+            } else {
+                fld.value.clone()
+            };
+            ListItem::new(Line::from(format!(
+                " {:<15}: {:<26}  {}",
+                fld.label, val, fld.hint
+            )))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("MQTT fields"))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶");
+    f.render_stateful_widget(list, chunks[1], state);
+
+    let footer = match status {
+        Some(s) => s.to_string(),
+        None => match mode {
+            Mode::Select => " ↑/↓ select  ·  Enter edit  ·  s save  ·  q/Esc quit".to_string(),
+            Mode::Edit => {
+                " type to edit  ·  ←/→ Home/End move  ·  Del  ·  [Space] bool  ·  Enter/Esc done"
+                    .to_string()
+            }
+        },
+    };
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        chunks[2],
+    );
+}

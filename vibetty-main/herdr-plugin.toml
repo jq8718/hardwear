@@ -1,0 +1,26 @@
+id = "vibetty"
+name = "Vibetty"
+version = "0.4.1-rc.1"
+min_herdr_version = "0.7.5"
+description = "Share a Herdr agent pane over MQTT. Trigger the `share` action to open a 1-row status bar below the focused pane that bridges it to remote clients."
+platforms = ["linux", "macos"]
+
+[[build]]
+# Install onto PATH (herdr resolves pane commands through PATH).
+command = ["cargo", "install", "--path", "."]
+
+# share action: opens the status pane below the focused agent pane.
+# Target pane id is passed via VIBETTY_HERDR_TARGET env.
+[[actions]]
+id = "share"
+title = "Share this agent pane over Vibetty"
+contexts = ["pane"]
+command = ["vibetty", "share-herdr"]
+
+# 1-row status pane running `vibetty herdr` (reads target from env).
+# Auto-closes when vibetty exits (plugin pane lifecycle).
+[[panes]]
+id = "herdr-share"
+title = "Vibetty"
+placement = "split"
+command = ["vibetty", "herdr"]

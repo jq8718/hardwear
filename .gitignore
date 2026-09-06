@@ -30,3 +30,6 @@ Thumbs.db
 TFT-147-HSD-ST7789-4WSPI-STM32/Progect/Objects/
 TFT-147-HSD-ST7789-4WSPI-STM32/Progect/Listings/
 TFT-147-HSD-ST7789-4WSPI-STM32/Progect/DebugConfig/
+
+# Vendored third-party: exclude large media assets (25MB README fonts/images)
+vibetty-main/assets/

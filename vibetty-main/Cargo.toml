@@ -1,0 +1,62 @@
+[package]
+name = "vibetty"
+version = "0.4.1-rc.1"
+edition = "2024"
+
+
+[features]
+default = ["swash"]
+swash = ["vibetty-screenshot/swash"]
+
+[dependencies]
+flexi_logger = "0.31"
+env_logger = "0.11.6"
+log = "0.4.25"
+clap = { version = "4.5", features = ["derive", "env"] }
+dotenv = "0.15"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
+
+anyhow = "1.0"
+
+axum = "0.8.1"
+
+tokio = { version = "1", features = ["full"] }
+
+futures-util = "0.3.32"
+
+dirs = "6"
+bytes = "1.11.1"
+uuid = { version = "1.21.0", features = ["v4"] }
+
+portable-pty = { version = "0.9.3", package = "portable-pty-psmux" }
+strip-ansi-escapes = "0.2.1"
+
+# TUI
+ratatui = "0.30"
+crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+tui-term = "0.3"
+tui-input = "0.15"
+vt100 = "0.16"
+
+# Screenshot / Image rendering
+vibetty-screenshot = { git = "https://github.com/second-state/vibetty-screenshot", tag = "v0.2.2" }
+image = "0.25"
+color_quant = "1.1"
+png = "0.17"
+rumqttc = "0.25.1"
+machine-uid = "0.6.0"
+sha2 = "0.11.0"
+rumqttd = { version = "0.20.0", features = ["websocket"] }
+# herdr 插件 SDK:封装 herdr 的 socket API(client/socket/env/config/state/log),
+# 用于下一步把 vibetty 做成真正的 herdr 插件(action/event/pane + daemon)。
+herdr-plugin = "0.1.8"
+# 接管 rumqttd 的 tracing 事件(它用 tracing,不是 log);见 main::logger_init 的 NullSubscriber。
+tracing = "0.1"
+
+[patch.crates-io]
+# 本地补丁:vt100 0.16.2 的 scroll_up 在「滚动区顶==屏顶」时不把滚出的行存进 scrollback,
+# 改成 scroll_top==0 即可(fork second-state/vt100-rust@a34c13a,已提上游 PR doy/vt100-rust#33)。
+vt100 = { git = "https://github.com/second-state/vt100-rust", rev = "a34c13a" }
