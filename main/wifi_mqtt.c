@@ -5,16 +5,15 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
 #include "mqtt_client.h"
 #include "cJSON.h"
 
 #include "wifi_mqtt.h"
 #include "state_led.h"
+#include "nvs_config.h"
 
-#define WIFI_SSID        "360WiFi-91868"
-#define WIFI_PASS        "18602191868"
-#define MQTT_BROKER_URI  "mqtt://broker.emqx.io:1883"
+/* WiFi / broker credentials and target instance now come from NVS
+ * (nvs_config), so a reflash no longer hard-codes the network. */
 #define DISCOVERY_TOPIC  "+/+/+/vibetty"
 
 static const char *TAG = "wifi_mqtt";
@@ -65,8 +64,21 @@ static void handle_presence(const char *topic, const char *data, int len)
     cJSON *title  = cJSON_GetObjectItem(root, "title");
 
     if (cJSON_IsString(prefix) && cJSON_IsString(format)) {
+        const char *target = nvs_config_target_prefix();
+        if (target[0] && strcmp(target, prefix->valuestring) != 0) {
+            ESP_LOGI(TAG, "presence prefix=%s not our target %s, ignore",
+                     prefix->valuestring, target);
+            cJSON_Delete(root);
+            return;
+        }
+
         strncpy(s_prefix, prefix->valuestring, sizeof(s_prefix) - 1);
         s_has_instance = true;
+        if (!target[0]) {
+            /* First adoption: lock this instance in NVS so later random
+             * presences cannot hijack s_prefix (multi-instance safety). */
+            nvs_config_save_target_prefix(s_prefix);
+        }
 
         bool text_mode = strcmp(format->valuestring, "text") == 0;
         char topic_buf[160];
@@ -138,7 +150,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
 static void mqtt_start(void)
 {
     esp_mqtt_client_config_t cfg = {
-        .broker.address.uri = MQTT_BROKER_URI,
+        .broker.address.uri = nvs_config_broker_uri(),
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -164,7 +176,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 
 esp_err_t wifi_mqtt_init(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
@@ -174,18 +185,15 @@ esp_err_t wifi_mqtt_init(void)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
 
-    wifi_config_t wifi_cfg = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-        },
-    };
+    wifi_config_t wifi_cfg = {0};
+    strncpy((char *) wifi_cfg.sta.ssid, nvs_config_wifi_ssid(), sizeof(wifi_cfg.sta.ssid) - 1);
+    strncpy((char *) wifi_cfg.sta.password, nvs_config_wifi_pass(), sizeof(wifi_cfg.sta.password) - 1);
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     state_led_set(LED_STATE_CONNECTING);
-    ESP_LOGI(TAG, "wifi started, connecting to %s", WIFI_SSID);
+    ESP_LOGI(TAG, "wifi started, connecting to %s", nvs_config_wifi_ssid());
     return ESP_OK;
 }
 

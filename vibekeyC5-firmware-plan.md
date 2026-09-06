@@ -105,6 +105,10 @@ CMakeLists `PRIV_REQUIRES` 需新增：`esp_driver_i2c`、`esp_driver_i2s`、`es
 - **nvs_config.c**：Wi-Fi/broker/键位/旋钮映射存 NVS；支持 MQTT 下发配置。
 - **OTA**：MQTT 或 HTTP OTA 升级。
 - **低功耗**：空闲 Deep-sleep，GPIO28（INT）或编码器活动唤醒。
+- **状态（2026-09-06 实测）**：
+  - ✅ **8a NVS 配置 + 目标实例持久化**：`nvs_config`（namespace `vkey`：ssid/pass/broker/vprefix）启动时装载，默认 `360WiFi-91868 / broker.emqx.io / ""`。wifi_mqtt 的 SSID/密码/broker 改从 NVS 读取（不再硬编码宏）。发现实例时把**首个** adopted 的 vibetty `prefix` 写入 NVS；重启后只绑定该持久化实例，其它随机 presence（实测 2 个真实公共 vibekeys 实例）一律忽略——修复了阶段 6 复现的「last-wins 多实例劫持」。实测：首启 `(none)→saved`，重启后仅 adopted `root/abc123/999/vibetty`、另两实例被 ignore。
+  - ⏳ 8b MQTT OTA 升级（需 OTA-capable 分区表）。
+  - ⏳ 8c 空闲 Deep-sleep 唤醒。
 - **验收**：断电重启配置不丢；可 OTA；空闲可休眠唤醒。
 
 ## 3. 关键风险与约束

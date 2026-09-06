@@ -12,6 +12,7 @@
 #include "state_led.h"
 #include "st7789.h"
 #include "wifi_mqtt.h"
+#include "nvs_config.h"
 
 #define COLOR_BG       0x0000
 #define COLOR_ENC1     0x07E0
@@ -100,6 +101,8 @@ void app_main(void)
              (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned) heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
              (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    ESP_ERROR_CHECK(nvs_config_init());
 
     ESP_ERROR_CHECK(state_led_init());
     ESP_ERROR_CHECK(st7789_init());
