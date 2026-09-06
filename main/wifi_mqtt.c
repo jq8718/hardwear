@@ -12,6 +12,7 @@
 #include "state_led.h"
 #include "nvs_config.h"
 #include "ota_mqtt.h"
+#include "lcd_vt.h"
 
 /* WiFi / broker credentials and target instance now come from NVS
  * (nvs_config), so a reflash no longer hard-codes the network. */
@@ -38,10 +39,16 @@ static void handle_screen_text(const uint8_t *data, int len)
     }
     uint8_t tag = data[0];
     int text_len = len - 1;
-    ESP_LOGI(TAG, "screen_text tag=%d bytes=%d", tag, text_len);
+    /* Feed the ANSI terminal. These run on the MQTT task and only mutate the
+     * char grid + dirty-row map; actual SPI drawing happens in lcd_vt_poll on
+     * the app task, so the display stays single-threaded. */
     if (tag == 0x00) {
-        // Full-frame baseline: log a short preview (raw ANSI, no full render yet).
-        ESP_LOGI(TAG, "screen full: %.80s", (const char *)(data + 1));
+        ESP_LOGI(TAG, "screen_text baseline %d bytes", text_len);
+        lcd_vt_feed_baseline(data + 1, text_len);
+    } else if (tag == 0x01) {
+        lcd_vt_feed(data + 1, text_len);
+    } else {
+        ESP_LOGW(TAG, "screen_text unknown tag %d", tag);
     }
 }
 
@@ -52,6 +59,7 @@ static void handle_presence(const char *topic, const char *data, int len)
         s_has_instance = false;
         ESP_LOGW(TAG, "instance offline (LWT)");
         state_led_set(LED_STATE_OFFLINE);
+        lcd_vt_set_status(LCD_ST_OFFLINE, NULL);
         return;
     }
 
@@ -93,14 +101,17 @@ static void handle_presence(const char *topic, const char *data, int len)
 
         char sync_buf[128];
         snprintf(sync_buf, sizeof(sync_buf),
-                 "{\"type\":\"sync\",\"data\":{\"width\":80,\"height\":24,\"pixels\":false}}");
+                 "{\"type\":\"sync\",\"data\":{\"width\":%d,\"height\":%d,\"pixels\":false}}",
+                 LCDVT_COLS, LCDVT_ROWS);
         snprintf(topic_buf, sizeof(topic_buf), "%s/control", s_prefix);
         esp_mqtt_client_publish(s_mqtt, topic_buf, sync_buf, 0, 1, 0);
     }
 
     if (cJSON_IsString(state)) {
-        state_led_set(strcmp(state->valuestring, "working") == 0
-                      ? LED_STATE_WORKING : LED_STATE_WAITING);
+        bool working = strcmp(state->valuestring, "working") == 0;
+        state_led_set(working ? LED_STATE_WORKING : LED_STATE_WAITING);
+        lcd_vt_set_status(working ? LCD_ST_WORKING : LCD_ST_WAITING,
+                          cJSON_IsString(title) ? title->valuestring : NULL);
     }
     cJSON_Delete(root);
 }
@@ -138,6 +149,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
         esp_mqtt_client_subscribe(s_mqtt, DISCOVERY_TOPIC, 0);
         ota_mqtt_on_connected(s_mqtt);
         state_led_set(LED_STATE_CONNECTING);
+        lcd_vt_set_status(LCD_ST_CONNECTING, NULL);
         break;
     case MQTT_EVENT_ERROR:
         if (ev->error_handle) {
@@ -155,6 +167,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
         s_has_instance = false;
         ESP_LOGW(TAG, "MQTT disconnected");
         state_led_set(LED_STATE_OFFLINE);
+        lcd_vt_set_status(LCD_ST_OFFLINE, NULL);
         break;
     case MQTT_EVENT_DATA:
         handle_data(ev);
@@ -192,6 +205,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGW(TAG, "wifi disconnected, reconnect");
         state_led_set(LED_STATE_CONNECTING);
+        lcd_vt_set_status(LCD_ST_CONNECTING, NULL);
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = data;
@@ -221,6 +235,7 @@ esp_err_t wifi_mqtt_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     state_led_set(LED_STATE_CONNECTING);
+    lcd_vt_set_status(LCD_ST_CONNECTING, NULL);
     ESP_LOGI(TAG, "wifi started, connecting to %s", nvs_config_wifi_ssid());
     return ESP_OK;
 }

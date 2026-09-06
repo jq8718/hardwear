@@ -21,6 +21,7 @@ main/
   main.c                  # 重构为 app 主循环 + 状态机
   encoder.c/.h            # 扩展为 3 路 + 增量读取接口
   st7789.c/.h             # 已存在（LCD + 文本渲染），按需加 ANSI 简易渲染
+  + lcd_vt.c/.h           # AI 状态视图：状态头 + VT100 子集微型终端（28x38）
   ws2812_encoder.c/.h     # 已存在（RMT 编码器）
   + i2c_io.c/.h           # I2C 主机 + PCA9535 探测/读取/优雅降级
   + audio.c/.h            # I2S PDM RX(双麦录音)
@@ -77,6 +78,8 @@ CMakeLists `PRIV_REQUIRES` 需新增：`esp_driver_i2c`、`esp_driver_i2s`、`es
   - **发输入**：单键 → `{p}/pty_in`（raw 字节）；文本 → `{p}/control`（`input_text` JSON）。
   - **presence 心跳**：`ts` > ~30s 判离线；LWT 空 payload = 实例下线。
 - **验收**：PC 上跑 `vibetty -- claude`（`[mqtt] enable=true`），ESP32 发现实例、LCD 显示终端文本、可发方向键/文本并回显。
+- **状态（2026-09-06 实测）**：✅ **LCD AI 状态视图 v0.9.6** —— 新增 `lcd_vt`（[lcd_vt.c](main/lcd_vt.c)）：顶部 **彩色状态头**（约 14px：色块 + `BOOT/LINKING/WAITING/WORKING/OFFLINE` 标签 + instance 标题，标题取 presence `title` 并支持 OSC `0;`/`2;` 窗口标题动态覆盖）+ **ANSI 微型终端正文**（28×38 字符网格，5×7 字号 scale1；`LCDVT_COLS/ROWS` 同时作为 sync 报给 vibetty 的 pty 尺寸，使镜像网格与面板精确一致）。正文为 VT100 子集解析器：CSI 光标 `H/f/A/B/C/D/G/d`、擦除 `J/K/X`、行插入/删除 `L/M`、字符插入/删除 `@/P`、SGR 忽略（面板单色渲染）、DEC 私有/alt-screen 忽略、CR/LF/BS/TAB/换行滚动。screen_text **tag0 全屏基线 → `lcd_vt_feed_baseline`**（清屏重放）、**tag1 增量 → `lcd_vt_feed`**（MQTT 任务仅改字符网格+脏行位图，SPI 绘制由主循环 `lcd_vt_poll` 单线程执行）。实测（fake_vibetty 夹具 + broker.emqx.io）：MQTT 连上 → adopt 实例 → 发 `sync {width:28,height:38}` → 收到 `screen_text baseline` 帧 → LCD 显示夹具正文「fake vibetty shell」+ `$ `；编码器方向键实测上行（夹具收到 `pty_in \x1b[C`）。接真实 vibetty 会话后标题/正文即为 agent 实时状态输出。
+
 
 ### 阶段 6：输入映射 + 状态机整合
 - **目标**：把物理输入映射成 vibetty keystrokes。
