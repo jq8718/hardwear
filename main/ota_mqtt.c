@@ -603,3 +603,8 @@ bool ota_mqtt_on_message(esp_mqtt_client_handle_t client, const char *topic,
     }
     return false;
 }
+
+bool ota_mqtt_busy(void)
+{
+    return s_state == OTA_RECEIVING;
+}

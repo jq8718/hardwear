@@ -104,11 +104,11 @@ CMakeLists `PRIV_REQUIRES` 需新增：`esp_driver_i2c`、`esp_driver_i2s`、`es
 - **目标**：配置持久化 + 可升级 + 低功耗。
 - **nvs_config.c**：Wi-Fi/broker/键位/旋钮映射存 NVS；支持 MQTT 下发配置。
 - **OTA**：MQTT 或 HTTP OTA 升级。
-- **低功耗**：空闲 Deep-sleep，GPIO28（INT）或编码器活动唤醒。
+- **低功耗**：空闲 Deep-sleep 唤醒。ESP32-C5 仅 **GPIO0~6** 为 RTC IO（实测 `rtc_io_channel.h`），编码器 ENC1/2（GPIO0/1/4/5）可作 EXT1 唤醒；**GPIO28（PCA9535 INT）与 ENC3（GPIO11/12）非 RTC IO，无法从深睡眠唤醒**（已实测确认）。
 - **状态（2026-09-06 实测）**：
   - ✅ **8a NVS 配置 + 目标实例持久化**：`nvs_config`（namespace `vkey`：ssid/pass/broker/vprefix）启动时装载，默认 `360WiFi-91868 / broker.emqx.io / ""`。wifi_mqtt 的 SSID/密码/broker 改从 NVS 读取（不再硬编码宏）。发现实例时把**首个** adopted 的 vibetty `prefix` 写入 NVS；重启后只绑定该持久化实例，其它随机 presence（实测 2 个真实公共 vibekeys 实例）一律忽略——修复了阶段 6 复现的「last-wins 多实例劫持」。实测：首启 `(none)→saved`，重启后仅 adopted `root/abc123/999/vibetty`、另两实例被 ignore。
   - ✅ **8b OTA 升级**：自定义分区表（nvs/otadata/phy/ota_0@0x20000/ota_1@0x220000 各 2MB/spiffs），`ota_mqtt` 实现两种传输：(1) **MQTT 分块**：`vkey/<chip>/ota/{ctl,data,status}`，data 帧 = 4B LE offset+2B LE len+payload，worker 任务严格按偏移顺序写 flash、跳过乱序/重复帧，设备在缓冲排空时回报 `written` 由宿主续传（面对公共 broker 的 QoS 抖动可自愈）；(2) **HTTP OTA（实测主通道）**：ctl 带 `url` → 设备 `esp_http_client` 直拉 PC 上 HTTP 服务器固件写 ota_1（实测 1.21MB ~3s，~390KB/s）。实测：v0.9.1(ota_0) 收 MQTT start ctl → HTTP 拉取 v0.9.3 → md5 校验 → `esp_ota_set_boot_partition` → 重启 boot log `Loaded app from partition at offset 0x220000` + `main: firmware v0.9.3`。公共 broker `broker.emqx.io` 的 QoS1/QoS0 长流实测周期性 `Network timeout` 断连（~每 20-40s），故大体积固件走 HTTP 拉取、MQTT 仅作控制面，最稳。
-  - ⏳ 8c 空闲 Deep-sleep 唤醒。
+  - ✅ **8c 空闲 Deep-sleep 唤醒**：新增 `power_mgmt` 空闲监视（默认 600s，烧录联调可改 12s）：主循环在编码器变化时 `power_mgmt_mark_activity()`，空闲超时 → deep sleep。**实测关键发现**：EXT1 是电平触发，而这颗编码器在停档位可能让某通道接地为低（实测 gp0/gp1/gp4=0、gp5=1），若直接使能 EXT1 ANY_LOW 会**瞬间重复唤醒**（实测每次 ~16s 即醒、timer 从不触发）；故门控：仅在 4 根唤醒脚**全部为高**时才使能 EXT1（真正转动会拉低唤醒），否则跳过 EXT1 靠定时器唤醒。**定时器(60s)恒使能**作为可靠唤醒兜底 + 定期重连 MQTT/拉取状态。实测（12s 空闲测试版）：`idle -> deep sleep` → USB-Serial/JTAG 掉线 → 定时唤醒重启 log `wake from deep sleep: timer (causes 0x10)` → WiFi/MQTT 自动重连收 screen_text，循环稳定；EXT1 唤醒路径在引脚为低时亦实测会触发。**注意**：深睡眠会断电 USB-Serial/JTAG（COM 口掉线 ~40s 重新枚举），烧录/OTA 工具须在唤醒窗口操作；600s 默认空闲让正常桌面临近使用几乎不睡眠。
 - **验收**：断电重启配置不丢；可 OTA；空闲可休眠唤醒。
 
 ## 3. 关键风险与约束

@@ -26,6 +26,9 @@ void ota_mqtt_init(void);
 void ota_mqtt_on_connected(esp_mqtt_client_handle_t client);
 bool ota_mqtt_on_message(esp_mqtt_client_handle_t client, const char *topic,
                          const uint8_t *data, int len);
+/* True while an OTA download is in progress; the power monitor must not
+ * deep-sleep the device mid-upgrade. */
+bool ota_mqtt_busy(void);
 
 #ifdef __cplusplus
 }

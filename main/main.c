@@ -4,12 +4,14 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_app_desc.h"
+#include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "encoder.h"
 #include "audio.h"
 #include "i2c_io.h"
 #include "input_map.h"
+#include "power_mgmt.h"
 #include "state_led.h"
 #include "st7789.h"
 #include "wifi_mqtt.h"
@@ -101,6 +103,22 @@ void app_main(void)
     const esp_app_desc_t *desc = esp_app_get_description();
     ESP_LOGI(TAG, "firmware v%s (ota slot current)", desc ? desc->version : "?");
 
+    uint32_t causes = esp_sleep_get_wakeup_causes();
+    if (causes & BIT(ESP_SLEEP_WAKEUP_UNDEFINED)) {
+        ESP_LOGI(TAG, "cold boot");
+    } else {
+        const char *w = "?";
+        if (causes & BIT(ESP_SLEEP_WAKEUP_EXT1)) {
+            w = "encoder GPIO (EXT1)";
+        } else if (causes & BIT(ESP_SLEEP_WAKEUP_TIMER)) {
+            w = "timer";
+        } else if (causes & BIT(ESP_SLEEP_WAKEUP_GPIO)) {
+            w = "GPIO";
+        }
+        ESP_LOGI(TAG, "wake from deep sleep: %s (causes 0x%x)", w,
+                 (unsigned) causes);
+    }
+
     ESP_LOGI(TAG, "Memory: internal free=%u, PSRAM total=%u, PSRAM free=%u",
              (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned) heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
@@ -115,6 +133,7 @@ void app_main(void)
     ESP_ERROR_CHECK(audio_init());
     ESP_ERROR_CHECK(input_map_init());
     ESP_ERROR_CHECK(wifi_mqtt_init());
+    power_mgmt_init();
     draw_encoder_layout();
     ESP_LOGI(TAG, "LCD encoder display ready");
 
@@ -125,6 +144,7 @@ void app_main(void)
         state_led_tick();
         input_map_tick();
 
+        bool user_active = false;
         for (int i = 0; i < ENC_COUNT; i++) {
             int raw;
             int acc;
@@ -134,12 +154,17 @@ void app_main(void)
                 st7789_draw_label_number("RAW ", raw, TEXT_X, s_enc_views[i].y_raw,
                                          COLOR_RAW, COLOR_BG, TEXT_SCALE, RAW_MAX_CHARS);
                 last_raw[i] = raw;
+                user_active = true;
             }
             if (acc != last_acc[i]) {
                 st7789_draw_label_number("ACC ", acc, TEXT_X, s_enc_views[i].y_acc,
                                          COLOR_ACC, COLOR_BG, TEXT_SCALE, ACC_MAX_CHARS);
                 last_acc[i] = acc;
+                user_active = true;
             }
+        }
+        if (user_active) {
+            power_mgmt_mark_activity();
         }
 
         vTaskDelay(pdMS_TO_TICKS(LOOP_DELAY_MS));
