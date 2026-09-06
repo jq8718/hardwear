@@ -11,6 +11,7 @@
 #include "wifi_mqtt.h"
 #include "state_led.h"
 #include "nvs_config.h"
+#include "ota_mqtt.h"
 
 /* WiFi / broker credentials and target instance now come from NVS
  * (nvs_config), so a reflash no longer hard-codes the network. */
@@ -111,6 +112,10 @@ static void handle_data(esp_mqtt_event_handle_t ev)
     memcpy(topic, ev->topic, tlen);
     topic[tlen] = 0;
 
+    if (ota_mqtt_on_message(s_mqtt, topic, (const uint8_t *) ev->data, ev->data_len)) {
+        return;
+    }
+
     if (ends_with(topic, "/vibetty")) {
         handle_presence(topic, (const char *) ev->data, ev->data_len);
     } else if (ends_with(topic, "/screen_text")) {
@@ -131,7 +136,19 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
         s_mqtt_connected = true;
         ESP_LOGI(TAG, "MQTT connected, subscribe %s", DISCOVERY_TOPIC);
         esp_mqtt_client_subscribe(s_mqtt, DISCOVERY_TOPIC, 0);
+        ota_mqtt_on_connected(s_mqtt);
         state_led_set(LED_STATE_CONNECTING);
+        break;
+    case MQTT_EVENT_ERROR:
+        if (ev->error_handle) {
+            ESP_LOGE(TAG, "MQTT error type=%d esp_err=%d sock_errno=%d conn_rc=%d",
+                     ev->error_handle->error_type,
+                     ev->error_handle->esp_tls_last_esp_err,
+                     ev->error_handle->esp_transport_sock_errno,
+                     ev->error_handle->connect_return_code);
+        } else {
+            ESP_LOGE(TAG, "MQTT error (no handle)");
+        }
         break;
     case MQTT_EVENT_DISCONNECTED:
         s_mqtt_connected = false;
@@ -151,6 +168,15 @@ static void mqtt_start(void)
 {
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = nvs_config_broker_uri(),
+        /* 8 KB buffers: OTA data frames run up to ~7.9 KB each. */
+        .buffer.size = 8192,
+        .buffer.out_size = 8192,
+        /* Persistent session: QoS1 OTA data sent while briefly offline is
+         * queued by the broker and delivered on reconnect, letting an OTA
+         * survive transient MQTT drops. */
+        .session.disable_clean_session = true,
+        .session.keepalive = 60,
+        .network.timeout_ms = 10000,
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -176,6 +202,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 
 esp_err_t wifi_mqtt_init(void)
 {
+    ota_mqtt_init();
+
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();

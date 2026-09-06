@@ -107,7 +107,7 @@ CMakeLists `PRIV_REQUIRES` 需新增：`esp_driver_i2c`、`esp_driver_i2s`、`es
 - **低功耗**：空闲 Deep-sleep，GPIO28（INT）或编码器活动唤醒。
 - **状态（2026-09-06 实测）**：
   - ✅ **8a NVS 配置 + 目标实例持久化**：`nvs_config`（namespace `vkey`：ssid/pass/broker/vprefix）启动时装载，默认 `360WiFi-91868 / broker.emqx.io / ""`。wifi_mqtt 的 SSID/密码/broker 改从 NVS 读取（不再硬编码宏）。发现实例时把**首个** adopted 的 vibetty `prefix` 写入 NVS；重启后只绑定该持久化实例，其它随机 presence（实测 2 个真实公共 vibekeys 实例）一律忽略——修复了阶段 6 复现的「last-wins 多实例劫持」。实测：首启 `(none)→saved`，重启后仅 adopted `root/abc123/999/vibetty`、另两实例被 ignore。
-  - ⏳ 8b MQTT OTA 升级（需 OTA-capable 分区表）。
+  - ✅ **8b OTA 升级**：自定义分区表（nvs/otadata/phy/ota_0@0x20000/ota_1@0x220000 各 2MB/spiffs），`ota_mqtt` 实现两种传输：(1) **MQTT 分块**：`vkey/<chip>/ota/{ctl,data,status}`，data 帧 = 4B LE offset+2B LE len+payload，worker 任务严格按偏移顺序写 flash、跳过乱序/重复帧，设备在缓冲排空时回报 `written` 由宿主续传（面对公共 broker 的 QoS 抖动可自愈）；(2) **HTTP OTA（实测主通道）**：ctl 带 `url` → 设备 `esp_http_client` 直拉 PC 上 HTTP 服务器固件写 ota_1（实测 1.21MB ~3s，~390KB/s）。实测：v0.9.1(ota_0) 收 MQTT start ctl → HTTP 拉取 v0.9.3 → md5 校验 → `esp_ota_set_boot_partition` → 重启 boot log `Loaded app from partition at offset 0x220000` + `main: firmware v0.9.3`。公共 broker `broker.emqx.io` 的 QoS1/QoS0 长流实测周期性 `Network timeout` 断连（~每 20-40s），故大体积固件走 HTTP 拉取、MQTT 仅作控制面，最稳。
   - ⏳ 8c 空闲 Deep-sleep 唤醒。
 - **验收**：断电重启配置不丢；可 OTA；空闲可休眠唤醒。
 

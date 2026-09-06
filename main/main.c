@@ -3,6 +3,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_app_desc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "encoder.h"
@@ -97,6 +98,9 @@ static void draw_encoder_layout(void)
 
 void app_main(void)
 {
+    const esp_app_desc_t *desc = esp_app_get_description();
+    ESP_LOGI(TAG, "firmware v%s (ota slot current)", desc ? desc->version : "?");
+
     ESP_LOGI(TAG, "Memory: internal free=%u, PSRAM total=%u, PSRAM free=%u",
              (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned) heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
