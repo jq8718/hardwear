@@ -10,7 +10,9 @@
 #define NVS_NS   "vkey"
 #define TAG      "nvs_config"
 
-#define DEFAULT_SSID   "360WiFi-91868"
+/* Primary AP default is the phone hotspot; the office router is the automatic
+ * fallback (wifi_mqtt AP logic). A stored NVS 'ssid' overrides this default. */
+#define DEFAULT_SSID   "Justin\xE7\x9A\x84Mate X6 \xE5\x85\xB8\xE8\x97\x8F\xE7\x89\x88"
 #define DEFAULT_PASS   "18602191868"
 #define DEFAULT_BROKER "mqtt://192.168.1.15:1883"
 
@@ -19,6 +21,7 @@ static char s_pass[64];
 static char s_broker[128];
 static char s_prefix[128];
 static bool s_loaded = false;
+static bool s_broker_stored = false;
 
 static void load_str(nvs_handle_t h, const char *key, char *dst, size_t cap,
                      const char *def)
@@ -52,7 +55,13 @@ esp_err_t nvs_config_init(void)
     }
     load_str(h, "ssid", s_ssid, sizeof(s_ssid), DEFAULT_SSID);
     load_str(h, "pass", s_pass, sizeof(s_pass), DEFAULT_PASS);
-    load_str(h, "broker", s_broker, sizeof(s_broker), DEFAULT_BROKER);
+    nvs_handle_t bh = h;
+    size_t blen = sizeof(s_broker);
+    s_broker_stored = nvs_get_str(bh, "broker", s_broker, &blen) == ESP_OK;
+    if (!s_broker_stored) {
+        strncpy(s_broker, DEFAULT_BROKER, sizeof(s_broker) - 1);
+        s_broker[sizeof(s_broker) - 1] = 0;
+    }
     load_str(h, "vprefix", s_prefix, sizeof(s_prefix), "");
     nvs_close(h);
     s_loaded = true;
@@ -67,6 +76,9 @@ const char *nvs_config_wifi_ssid(void)       { return s_ssid; }
 const char *nvs_config_wifi_pass(void)       { return s_pass; }
 const char *nvs_config_broker_uri(void)      { return s_broker; }
 const char *nvs_config_target_prefix(void)   { return s_prefix; }
+/* True only when an explicit 'broker' was stored in NVS (vs. the compiled-in
+ * default), so wifi_mqtt can promote it ahead of the per-network candidates. */
+bool nvs_config_broker_stored(void)          { return s_broker_stored; }
 
 esp_err_t nvs_config_save_target_prefix(const char *prefix)
 {

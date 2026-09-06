@@ -5,6 +5,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "mqtt_client.h"
 #include "cJSON.h"
 
@@ -27,12 +28,43 @@
  * appears. The value mirrors vibetty's [mqtt] username fallback ("root"). */
 #define BIND_USER  "root"
 
+/* Two known networks the device and PC roam between. AP0 = primary (default
+ * phone hotspot; NVS 'ssid' can override), AP1 = fallback, chosen as whichever
+ * of these two the primary is NOT so a stored override never duplicates an AP.
+ * AP switch triggers on any ESP disconnect reason >= 200 (beacon / no-AP /
+ * auth / assoc / handshake failures all mean "this AP is unreachable"). */
+#define AP_HOTSPOT_SSID  "Justin\xE7\x9A\x84Mate X6 \xE5\x85\xB8\xE8\x97\x8F\xE7\x89\x88"
+#define AP_HOTSPOT_PASS  "18602191868"
+#define AP_OFFICE_SSID   "360WiFi-91868"
+#define AP_OFFICE_PASS   "18602191868"
+#define AP_REPROBE_MS    60000   /* on fallback, re-probe primary every 60 s */
+
+/* mosquitto runs on the PC, so its address depends on which net the STA joined.
+ * Both are tried with the current AP's broker first; the disconnect of the
+ * other candidate never happens because the device is only ever on one net.
+ * An explicit stored NVS 'broker' leads the candidate list if present. */
+#define BROKER_OFFICE_URI   "mqtt://192.168.1.15:1883"
+#define BROKER_HOTSPOT_URI  "mqtt://192.168.43.125:1883"
+
 static const char *TAG = "wifi_mqtt";
 
 static esp_mqtt_client_handle_t s_mqtt = NULL;
 static bool s_mqtt_connected = false;
 static bool s_has_instance = false;
 static char s_prefix[128] = {0};
+
+static int  s_ap_cur = 0;             /* 0 = primary, 1 = fallback */
+static bool s_wifi_up = false;        /* STA has an IP (net is usable) */
+static char s_ap_ssid[33] = {0};      /* ssid of the AP we last configured */
+static esp_timer_handle_t s_ap_timer = NULL;
+
+/* Broker candidates in try order, rebuilt on each fresh association. */
+static const char *s_broker_cand[3];
+static int         s_broker_n = 0;
+static int         s_broker_i = 0;
+static int         s_conn_fail = 0;         /* consecutive connect failures */
+static bool        s_ever_conn = false;     /* connected once to this client */
+static esp_timer_handle_t s_fail_timer = NULL;
 
 static bool ends_with(const char *s, const char *suffix)
 {
@@ -200,7 +232,10 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
     switch (event_id) {
     case MQTT_EVENT_CONNECTED:
         s_mqtt_connected = true;
-        ESP_LOGI(TAG, "MQTT connected, subscribe %s", DISCOVERY_TOPIC);
+        s_conn_fail = 0;
+        s_ever_conn = true;
+        ESP_LOGI(TAG, "MQTT connected to %s, subscribe %s",
+                 s_broker_cand[s_broker_i], DISCOVERY_TOPIC);
         esp_mqtt_client_subscribe(s_mqtt, DISCOVERY_TOPIC, 0);
         ota_mqtt_on_connected(s_mqtt);
         state_led_set(LED_STATE_CONNECTING);
@@ -215,6 +250,21 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
                      ev->error_handle->connect_return_code);
         } else {
             ESP_LOGE(TAG, "MQTT error (no handle)");
+        }
+        /* A TCP-transport failure before ever connecting means this broker
+         * address is unreachable from the current net (we probed the wrong
+         * candidate). Two such failures in a row -> move to the next one. Once
+         * a candidate has connected, later drops are broker outages, not wrong
+         * candidates, so esp-mqtt's own reconnect to the same URI handles it. */
+        if (ev->error_handle &&
+            ev->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT &&
+            !s_ever_conn && s_broker_n > 1 && ++s_conn_fail >= 2) {
+            int prev = s_broker_i;
+            s_conn_fail = 0;
+            s_broker_i = (s_broker_i + 1) % s_broker_n;
+            ESP_LOGW(TAG, "broker %s unreachable, trying %s",
+                     s_broker_cand[prev], s_broker_cand[s_broker_i]);
+            esp_timer_start_once(s_fail_timer, 100 * 1000);
         }
         break;
     case MQTT_EVENT_DISCONNECTED:
@@ -236,8 +286,14 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
 
 static void mqtt_start(void)
 {
+    if (s_broker_n == 0) {
+        s_broker_cand[0] = nvs_config_broker_uri();
+        s_broker_n = 1;
+        s_broker_i = 0;
+    }
+    const char *uri = s_broker_cand[s_broker_i];
     esp_mqtt_client_config_t cfg = {
-        .broker.address.uri = nvs_config_broker_uri(),
+        .broker.address.uri = uri,
         /* Inbound buffer sized for /screen JPEG frames (the transcript relay
          * and vibetty -q high publish ~8-16 KB bodies). ESP-MQTT silently drops
          * inbound payloads larger than buffer.size, so this must exceed the
@@ -249,29 +305,137 @@ static void mqtt_start(void)
          * survive transient MQTT drops. */
         .session.disable_clean_session = true,
         .session.keepalive = 60,
-        /* Generous read timeout: emqx.io from this network sits at ~300 ms RTT
-         * with jitter; the old 10 s timeout treated ordinary stalls as dead. */
-        .network.timeout_ms = 20000,
+        /* Local LAN broker (mosquitto on the PC): a connect is sub-second, so a
+         * short read timeout doubles as fast candidate failover instead of
+         * stalling on an unreachable IP for many seconds. */
+        .network.timeout_ms = 8000,
     };
+    ESP_LOGI(TAG, "MQTT client -> %s", uri);
+    s_ever_conn = false;
     s_mqtt = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(s_mqtt);
+}
+
+/* Tear down the MQTT client when the link goes away. Each STA reconnect ends in
+ * a fresh IP_EVENT_STA_GOT_IP which calls mqtt_start(); without stopping here a
+ * blip would stack a second client on top of the old one. */
+static void mqtt_stop(void)
+{
+    if (s_mqtt != NULL) {
+        esp_mqtt_client_destroy(s_mqtt);
+        s_mqtt = NULL;
+    }
+    s_mqtt_connected = false;
+    s_has_instance = false;
+}
+
+static void broker_cands_add(const char *u)
+{
+    for (int i = 0; i < s_broker_n; i++) {
+        if (strcmp(s_broker_cand[i], u) == 0) {
+            return;
+        }
+    }
+    if (s_broker_n < 3) {
+        s_broker_cand[s_broker_n++] = u;
+    }
+}
+
+/* Broker try-list for the current association: an explicit stored NVS 'broker'
+ * leads, then the current net's broker, then the other net's broker. */
+static void broker_cands_build(void)
+{
+    s_broker_n = 0;
+    if (nvs_config_broker_stored()) {
+        broker_cands_add(nvs_config_broker_uri());
+    }
+    bool hotspot = strcmp(s_ap_ssid, AP_HOTSPOT_SSID) == 0;
+    broker_cands_add(hotspot ? BROKER_HOTSPOT_URI : BROKER_OFFICE_URI);
+    broker_cands_add(hotspot ? BROKER_OFFICE_URI : BROKER_HOTSPOT_URI);
+    s_broker_i = 0;
+    s_conn_fail = 0;
+}
+
+/* Move to the next broker candidate. Run from the esp_timer task, never from an
+ * MQTT event callback (destroying a client from its own handler is unsafe). */
+static void mqtt_failover_do(void *arg)
+{
+    (void) arg;
+    mqtt_stop();
+    mqtt_start();
+}
+
+static void wifi_ap_set(int ap)
+{
+    const char *ssid, *pass;
+    if (ap == 0) {
+        ssid = nvs_config_wifi_ssid();
+        pass = nvs_config_wifi_pass();
+    } else if (strcmp(nvs_config_wifi_ssid(), AP_HOTSPOT_SSID) == 0) {
+        ssid = AP_OFFICE_SSID;
+        pass = AP_OFFICE_PASS;
+    } else {
+        ssid = AP_HOTSPOT_SSID;
+        pass = AP_HOTSPOT_PASS;
+    }
+    wifi_config_t cfg = {0};
+    strncpy((char *) cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
+    strncpy((char *) cfg.sta.password, pass, sizeof(cfg.sta.password) - 1);
+    esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "set_config AP%d failed: %s", ap, esp_err_to_name(e));
+        return;
+    }
+    strncpy(s_ap_ssid, ssid, sizeof(s_ap_ssid) - 1);
+    ESP_LOGI(TAG, "wifi connecting to AP%d ssid=%s", ap, ssid);
+    esp_wifi_connect();
+}
+
+/* While parked on the fallback (preferred AP absent), periodically drop the
+ * link so the STA reconnect logic returns to the primary once it is back. */
+static void ap_pref_tick(void *arg)
+{
+    (void) arg;
+    if (!s_wifi_up || s_ap_cur != 1) {
+        return;
+    }
+    ESP_LOGI(TAG, "on fallback AP, dropping link to re-probe primary");
+    s_ap_cur = 0;
+    esp_wifi_disconnect();
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void) arg;
     (void) data;
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "wifi disconnected, reconnect");
-        state_led_set(LED_STATE_CONNECTING);
-        lcd_vt_set_status(LCD_ST_CONNECTING, NULL);
-        esp_wifi_connect();
+    if (base == WIFI_EVENT) {
+        if (id == WIFI_EVENT_STA_START) {
+            wifi_ap_set(s_ap_cur);
+        } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+            wifi_event_sta_disconnected_t *d = data;
+            ESP_LOGW(TAG, "wifi disconnected (reason=%d), ap=%d",
+                     d ? d->reason : -1, s_ap_cur);
+            state_led_set(LED_STATE_CONNECTING);
+            lcd_vt_set_status(LCD_ST_CONNECTING, NULL);
+            mqtt_stop();
+            s_wifi_up = false;
+            /* Reasons 0..199 are 802.11 deauths (AP kicked us / transient);
+             * reasons >=200 mean the connect attempt itself failed (beacon
+             * timeout / no AP / auth / assoc / handshake), i.e. this AP is
+             * unreachable -- rotate to the other one. */
+            if (d && d->reason >= 200) {
+                s_ap_cur = (s_ap_cur + 1) % 2;
+                ESP_LOGI(TAG, "AP unreachable, switching to AP%d", s_ap_cur);
+            }
+            wifi_ap_set(s_ap_cur);
+        }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = data;
-        ESP_LOGI(TAG, "got IP " IPSTR, IP2STR(&ev->ip_info.ip));
+        ESP_LOGI(TAG, "got IP " IPSTR " (ssid=%s ap=%d)",
+                 IP2STR(&ev->ip_info.ip), s_ap_ssid, s_ap_cur);
+        s_wifi_up = true;
+        broker_cands_build();
         mqtt_start();
     }
 }
@@ -301,9 +465,20 @@ esp_err_t wifi_mqtt_init(void)
      * esp-mqtt's "Network timeout while reading" and drop every ~20 s. */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
+    esp_timer_create_args_t targs = { .callback = ap_pref_tick, .name = "ap_pref" };
+    if (esp_timer_create(&targs, &s_ap_timer) == ESP_OK) {
+        esp_timer_start_periodic(s_ap_timer, AP_REPROBE_MS * 1000);
+    }
+    esp_timer_create_args_t ftargs = { .callback = mqtt_failover_do, .name = "mqtt_fail" };
+    esp_timer_create(&ftargs, &s_fail_timer);
+
     state_led_set(LED_STATE_CONNECTING);
     lcd_vt_set_status(LCD_ST_CONNECTING, NULL);
-    ESP_LOGI(TAG, "wifi started, connecting to %s", nvs_config_wifi_ssid());
+    ESP_LOGI(TAG, "wifi started, primary=%s fallback=%s brokers={%s,%s}",
+             nvs_config_wifi_ssid(),
+             strcmp(nvs_config_wifi_ssid(), AP_HOTSPOT_SSID) == 0 ? AP_OFFICE_SSID
+                                                                  : AP_HOTSPOT_SSID,
+             BROKER_OFFICE_URI, BROKER_HOTSPOT_URI);
     return ESP_OK;
 }
 

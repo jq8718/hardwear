@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -15,6 +17,7 @@ const char *nvs_config_wifi_ssid(void);
 const char *nvs_config_wifi_pass(void);
 const char *nvs_config_broker_uri(void);
 const char *nvs_config_target_prefix(void);   /* "" when unset */
+bool nvs_config_broker_stored(void);          /* explicit 'broker' saved? */
 
 esp_err_t nvs_config_init(void);
 esp_err_t nvs_config_save_target_prefix(const char *prefix);
