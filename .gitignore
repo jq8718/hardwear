@@ -36,3 +36,7 @@ TFT-147-HSD-ST7789-4WSPI-STM32/Progect/DebugConfig/
 
 # Vendored third-party: exclude large media assets (25MB README fonts/images)
 vibetty-main/assets/
+
+# Vosk offline ASR model (downloaded separately, ~40MB)
+vosk-model-*/
+pc_asr/vosk-model-*/

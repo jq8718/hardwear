@@ -90,10 +90,15 @@ CMakeLists `PRIV_REQUIRES` 需新增：`esp_driver_i2c`、`esp_driver_i2s`、`es
 - **验收**：旋转/按键能控制 PC 上的 claude/codex 终端。
 
 ### 阶段 7：语音旁路（可选，自定义扩展）
-- **目标**：Voice 键 → PDM 采集 → 送自建 PC ASR（Whisper.cpp）→ 文本回注 vibetty。
+- **目标**：Voice 键 → PDM 采集 → 送自建 PC ASR → 文本回注 vibetty。
 - **说明**：vibetty 无音频 topic（0.4.0 已移除服务端 ASR），ESP32-C5 跑不动本地 Whisper，故走**自定义旁路**（非 vibetty 协议）。
-- 采集双麦 PCM → 经自定义 MQTT topic / TCP / WebSocket 送 PC 端 Whisper.cpp server → 得到文本 → `{p}/control` 的 `input_text` 发回。
-- **验收**：语音 → PC 识别 → 文本进入终端。
+- 采集双麦 PCM → 经自定义 MQTT topic 送 PC 端 ASR → 得到文本 → `{p}/control` 的 `input_text` 发回。
+- **状态（2026-09-06 实测）**：
+  - ✅ PC ASR 服务 `build/vibekey_asr.py`（部署并验证）：MQTT 收 `{p}/audio_pcm` 16k/16bit 单声道帧，Vosk（离线，`vosk-model-small-en-us-0.15`，可换 cn 模型）识别，`stop` 后把文本以 `input_text` 发回 `{p}/control`。实测真实语音样张识别并成功进入 vibetty control。
+  - ✅ 固件软件 PDM→16kHz CIC2 降采样 `audio_pdm_decimate()`（无硬件 PDM2PCM）：上电自检合成 440Hz PDM→实测恢复 439Hz OK。
+  - ⏳ PCM-over-MQTT 上行 + Voice 键触发：依赖 MIC 与 PCA9535 Voice 键焊接后联调（`audio_pcm` 20ms 帧 + `audio_ctl` start/stop 已定义）。
+- 协议：`{p}/audio_ctl`（`{"cmd":"start"|"stop"}`）+ `{p}/audio_pcm`（裸 PCM，qos0 流）。双麦立体声各 16k 先求和为单声道。
+- **验收**：语音 → PC 识别 → 文本进入终端（MIC/键到位后整链联调）。
 
 ### 阶段 8：健壮性（NVS / OTA / 低功耗）
 - **目标**：配置持久化 + 可升级 + 低功耗。
