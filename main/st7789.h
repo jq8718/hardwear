@@ -33,6 +33,11 @@ void st7789_draw_number(int value, int x, int y, uint16_t fg, uint16_t bg, int s
 void st7789_draw_label_number(const char *label, int value, int x, int y,
                               uint16_t fg, uint16_t bg, int scale, int max_chars);
 
+/* Copy a row-major RGB565 bitmap (w x h) into the canvas at (x, y). The
+ * bitmap's top-left pixel lands at canvas (x, y); out-of-bounds pixels are
+ * clipped. Write to the canvas only, call st7789_commit() to display. */
+void st7789_blit_rgb565(int x, int y, const uint16_t *pix, int w, int h);
+
 /* Push the offscreen canvas to the panel (full-frame transpose blit). */
 void st7789_commit(void);
 

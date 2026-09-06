@@ -15,6 +15,10 @@ extern "C" {
 #define LCDVT_COLS 26
 #define LCDVT_ROWS 8
 
+/* Status-header height in px at the top of the canvas. When a JPEG-capable
+ * vibetty instance is mirrored the decoded image fills the body below this. */
+#define LCD_HEADER_H 20
+
 typedef enum {
     LCD_ST_BOOT = 0,
     LCD_ST_CONNECTING,
@@ -26,6 +30,10 @@ typedef enum {
 void lcd_vt_init(void);
 /* Update the colored status header. */
 void lcd_vt_set_status(lcd_vt_state_t st, const char *title);
+/* Switch to/from bitmap mirror mode. In pixels mode the text grid is blanked
+ * and poll() only maintains the status header; screen_jpeg draws the body. */
+void lcd_vt_set_pixels(bool on);
+bool lcd_vt_pixels_mode(void);
 /* terminal API, ANSI-fed: tag 0x00 baseline resets the grid then replays;
  * tag 0x01 incremental appends raw ANSI bytes. */
 void lcd_vt_feed_baseline(const uint8_t *data, size_t len);

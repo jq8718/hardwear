@@ -17,7 +17,7 @@
 #define LCD_SCALE 2             /* text is drawn at 2x */
 #define ROW_STEP  18            /* 8-row glyph at 2x (16 px) + 2 px gap */
 #define X_MARGIN  4
-#define HEADER_H  20            /* px above the terminal area */
+#define HEADER_H  LCD_HEADER_H    /* px above the terminal area */
 #define TERM_Y    (HEADER_H + 2)
 #define CHAR_W    ST7789_CHAR_W(LCD_SCALE)   /* 12 px per char at 2x */
 
@@ -47,6 +47,8 @@ static uint8_t s_r, s_c;            /* cursor */
 static lcd_vt_state_t s_status = LCD_ST_BOOT;
 static char s_title[40] = "VibeKey";
 static bool s_header_dirty = true;
+static bool s_pixels = false;       /* bitmap mirror mode (JPEG body) */
+static bool s_body_blank = false;   /* app task must clear the body once */
 
 /* --- parsing state, resumable across feed() chunks --- */
 static uint8_t s_mode = SM_PLAIN;
@@ -411,6 +413,40 @@ void lcd_vt_set_status(lcd_vt_state_t st, const char *title)
     s_header_dirty = true;
 }
 
+static void draw_header(void);   /* defined below (used by set_pixels) */
+
+/* Note: this only flips state flags; the actual blanking/drawing happens in
+ * lcd_vt_poll on the app task. It is called from the MQTT task on instance
+ * adoption, and SPI/canvas writes must never run there (they race the app
+ * task's commits). */
+void lcd_vt_set_pixels(bool on)
+{
+    if (s_pixels == on) {
+        return;
+    }
+    s_pixels = on;
+    s_header_dirty = true;
+    s_body_blank = true;    /* stale pixels (either mode) get blanked */
+    if (!on) {
+        /* Back to text: clear the terminal grid so the next poll redraws all
+         * rows from scratch over the blanked body. */
+        for (int r = 0; r < LCDVT_ROWS; r++) {
+            memset(s_grid[r], ' ', LCDVT_COLS);
+        }
+        s_r = 0;
+        s_c = 0;
+        s_mode = SM_PLAIN;
+        s_dirty = ~0ULL;
+    } else {
+        s_dirty = 0;        /* text grid hidden behind the mirror body */
+    }
+}
+
+bool lcd_vt_pixels_mode(void)
+{
+    return s_pixels;
+}
+
 static void draw_header(void)
 {
     uint16_t col = status_color();
@@ -467,6 +503,20 @@ void lcd_vt_poll(void)
     if (s_header_dirty) {
         draw_header();
         need_commit = true;
+    }
+    if (s_body_blank) {
+        st7789_fill_rect(0, HEADER_H, ST7789_WIDTH,
+                         ST7789_HEIGHT - HEADER_H, COL_BG);
+        s_body_blank = false;
+        need_commit = true;
+    }
+    if (s_pixels) {
+        /* Bitmap mirror mode: the body belongs to screen_jpeg; only the status
+         * header above it is drawn here. */
+        if (need_commit) {
+            st7789_commit();
+        }
+        return;
     }
     if (s_dirty != 0) {
         need_commit = true;

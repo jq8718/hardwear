@@ -42,6 +42,7 @@ static spi_device_handle_t s_spi = NULL;
 
 static uint16_t *s_fb;             /* canvas[320][172], [x*ST7789_HEIGHT + y] */
 static uint16_t s_row[NATIVE_W] __attribute__((aligned(4)));
+static uint8_t s_rowb[NATIVE_W * 2] __attribute__((aligned(4)));
 
 static void st7789_send_cmd(uint8_t cmd)
 {
@@ -223,6 +224,29 @@ void st7789_set_backlight(bool on)
     gpio_set_level(PIN_BLK, on ? 1 : 0);
 }
 
+void st7789_blit_rgb565(int x, int y, const uint16_t *pix, int w, int h)
+{
+    if (!s_fb || !pix || w <= 0 || h <= 0) {
+        return;
+    }
+    int x0 = x, y0 = y;
+    int x1 = x + w - 1, y1 = y + h - 1;
+    if (x1 < 0 || y1 < 0 || x0 >= ST7789_WIDTH || y0 >= ST7789_HEIGHT) {
+        return;
+    }
+    if (x0 < 0) { pix += -x0; x0 = 0; }      /* skip clipped left pixels */
+    if (y0 < 0) { pix += (-y0) * w; y0 = 0; }
+    if (x1 >= ST7789_WIDTH) x1 = ST7789_WIDTH - 1;
+    if (y1 >= ST7789_HEIGHT) y1 = ST7789_HEIGHT - 1;
+
+    for (int yy = y0; yy <= y1; yy++) {
+        const uint16_t *row = pix + (yy - y0) * w;
+        for (int xx = x0; xx <= x1; xx++) {
+            s_fb[xx * ST7789_HEIGHT + yy] = row[xx - x0];
+        }
+    }
+}
+
 void st7789_commit(void)
 {
     if (!s_fb) {
@@ -251,7 +275,13 @@ void st7789_commit(void)
             s_row[C] = fbrow[NATIVE_W - 1 - C];
         }
 #endif
-        st7789_flush((const uint8_t *)s_row, sizeof(s_row));
+        /* ST7789 samples the high byte of each 16-bit pixel first, so the
+         * native little-endian s_row must be byte-swapped on the wire. */
+        for (int C = 0; C < NATIVE_W; C++) {
+            s_rowb[2 * C]     = (uint8_t)(s_row[C] >> 8);
+            s_rowb[2 * C + 1] = (uint8_t)(s_row[C] & 0xFF);
+        }
+        st7789_flush(s_rowb, sizeof(s_rowb));
     }
     gpio_set_level(PIN_CS, 1);
 }

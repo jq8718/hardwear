@@ -13,10 +13,19 @@
 #include "nvs_config.h"
 #include "ota_mqtt.h"
 #include "lcd_vt.h"
+#include "screen_jpeg.h"
+#include "st7789.h"
 
 /* WiFi / broker credentials and target instance now come from NVS
  * (nvs_config), so a reflash no longer hard-codes the network. */
 #define DISCOVERY_TOPIC  "+/+/+/vibetty"
+
+/* While no instance is locked, only adopt a presence whose user segment is
+ * BIND_USER. A shared broker (broker.emqx.io) carries foreign tenants under
+ * their own user namespace (e.g. "vibekeys"); without this gate the first
+ * random retained presence could hijack binding before our real instance
+ * appears. The value mirrors vibetty's [mqtt] username fallback ("root"). */
+#define BIND_USER  "root"
 
 static const char *TAG = "wifi_mqtt";
 
@@ -52,6 +61,29 @@ static void handle_screen_text(const uint8_t *data, int len)
     }
 }
 
+static bool first_seg_eq(const char *p, const char *seg)
+{
+    size_t sl = strlen(seg);
+    return strncmp(p, seg, sl) == 0 && (p[sl] == '/' || p[sl] == 0);
+}
+
+/* vibetty prefix = {user}/{device}/{pid}/vibetty. pid differs on every run,
+ * so match the stable user/device pair, never the exact string. */
+static bool same_user_device(const char *a, const char *b)
+{
+    const char *a2 = strchr(a, '/');
+    const char *b2 = strchr(b, '/');
+    if (!a2 || !b2 || a2 - a != b2 - b || strncmp(a, b, (size_t)(a2 - a)) != 0) {
+        return false;
+    }
+    const char *a3 = strchr(a2 + 1, '/');
+    const char *b3 = strchr(b2 + 1, '/');
+    if (!a3 || !b3 || a3 - a2 != b3 - b2 || strncmp(a2, b2, (size_t)(a3 - a2)) != 0) {
+        return false;
+    }
+    return true;
+}
+
 static void handle_presence(const char *topic, const char *data, int len)
 {
     (void) topic;
@@ -59,6 +91,8 @@ static void handle_presence(const char *topic, const char *data, int len)
         s_has_instance = false;
         ESP_LOGW(TAG, "instance offline (LWT)");
         state_led_set(LED_STATE_OFFLINE);
+        lcd_vt_set_pixels(false);
+        screen_jpeg_reset();
         lcd_vt_set_status(LCD_ST_OFFLINE, NULL);
         return;
     }
@@ -74,9 +108,18 @@ static void handle_presence(const char *topic, const char *data, int len)
 
     if (cJSON_IsString(prefix) && cJSON_IsString(format)) {
         const char *target = nvs_config_target_prefix();
-        if (target[0] && strcmp(target, prefix->valuestring) != 0) {
-            ESP_LOGI(TAG, "presence prefix=%s not our target %s, ignore",
-                     prefix->valuestring, target);
+        if (target[0]) {
+            /* Locked instance: match by user/device so the same vibetty on a
+             * new pid (fresh run) re-binds without an NVS update. */
+            if (!same_user_device(target, prefix->valuestring)) {
+                ESP_LOGI(TAG, "presence prefix=%s not our target %s, ignore",
+                         prefix->valuestring, target);
+                cJSON_Delete(root);
+                return;
+            }
+        } else if (!first_seg_eq(prefix->valuestring, BIND_USER)) {
+            ESP_LOGI(TAG, "presence prefix=%s not under user %s, ignore",
+                     prefix->valuestring, BIND_USER);
             cJSON_Delete(root);
             return;
         }
@@ -84,25 +127,32 @@ static void handle_presence(const char *topic, const char *data, int len)
         strncpy(s_prefix, prefix->valuestring, sizeof(s_prefix) - 1);
         s_has_instance = true;
         if (!target[0]) {
-            /* First adoption: lock this instance in NVS so later random
-             * presences cannot hijack s_prefix (multi-instance safety). */
+            /* First adoption: lock the stable user/device pair in NVS so later
+             * random presences cannot hijack s_prefix (multi-instance safety). */
             nvs_config_save_target_prefix(s_prefix);
         }
 
         bool text_mode = strcmp(format->valuestring, "text") == 0;
+        bool pixels = !text_mode;   /* "high"/"medium"/"low" = JPEG screen */
         char topic_buf[160];
         snprintf(topic_buf, sizeof(topic_buf), "%s/%s", s_prefix,
                  text_mode ? "screen_text" : "screen");
         esp_mqtt_client_subscribe(s_mqtt, topic_buf, 0);
 
-        ESP_LOGI(TAG, "instance prefix=%s format=%s title=%s",
-                 s_prefix, format->valuestring,
+        ESP_LOGI(TAG, "instance prefix=%s format=%s pixels=%d title=%s",
+                 s_prefix, format->valuestring, pixels ? 1 : 0,
                  cJSON_IsString(title) ? title->valuestring : "?");
 
+        /* A JPEG-capable instance is asked to rasterize exactly the canvas
+         * body (below the status header) so decoded pixels map 1:1. A text
+         * instance still gets the old char-grid PTY size. */
+        lcd_vt_set_pixels(pixels);
         char sync_buf[128];
         snprintf(sync_buf, sizeof(sync_buf),
-                 "{\"type\":\"sync\",\"data\":{\"width\":%d,\"height\":%d,\"pixels\":false}}",
-                 LCDVT_COLS, LCDVT_ROWS);
+                 "{\"type\":\"sync\",\"data\":{\"width\":%d,\"height\":%d,\"pixels\":%s}}",
+                 pixels ? ST7789_WIDTH : LCDVT_COLS,
+                 pixels ? (ST7789_HEIGHT - LCD_HEADER_H) : LCDVT_ROWS,
+                 pixels ? "true" : "false");
         snprintf(topic_buf, sizeof(topic_buf), "%s/control", s_prefix);
         esp_mqtt_client_publish(s_mqtt, topic_buf, sync_buf, 0, 1, 0);
     }
@@ -132,7 +182,12 @@ static void handle_data(esp_mqtt_event_handle_t ev)
     } else if (ends_with(topic, "/screen_text")) {
         handle_screen_text((const uint8_t *) ev->data, ev->data_len);
     } else if (ends_with(topic, "/screen")) {
-        ESP_LOGI(TAG, "screen JPEG %d bytes (decode deferred)", ev->data_len);
+        /* JPEG screen frame; may arrive as one or several MQTT_EVENT_DATA
+         * events (large payloads are chunked), so hand the fragments to the
+         * reassembler with the event offsets. Decode happens later on the app
+         * task, not here. */
+        screen_jpeg_feed((const uint8_t *) ev->data, ev->data_len,
+                         ev->current_data_offset, ev->total_data_len);
     }
 }
 
@@ -167,6 +222,8 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t event_i
         s_has_instance = false;
         ESP_LOGW(TAG, "MQTT disconnected");
         state_led_set(LED_STATE_OFFLINE);
+        lcd_vt_set_pixels(false);
+        screen_jpeg_reset();
         lcd_vt_set_status(LCD_ST_OFFLINE, NULL);
         break;
     case MQTT_EVENT_DATA:
@@ -181,15 +238,20 @@ static void mqtt_start(void)
 {
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = nvs_config_broker_uri(),
-        /* 8 KB buffers: OTA data frames run up to ~7.9 KB each. */
-        .buffer.size = 8192,
+        /* Inbound buffer sized for /screen JPEG frames (the transcript relay
+         * and vibetty -q high publish ~8-16 KB bodies). ESP-MQTT silently drops
+         * inbound payloads larger than buffer.size, so this must exceed the
+         * biggest screen frame. */
+        .buffer.size = 32768,
         .buffer.out_size = 8192,
         /* Persistent session: QoS1 OTA data sent while briefly offline is
          * queued by the broker and delivered on reconnect, letting an OTA
          * survive transient MQTT drops. */
         .session.disable_clean_session = true,
         .session.keepalive = 60,
-        .network.timeout_ms = 10000,
+        /* Generous read timeout: emqx.io from this network sits at ~300 ms RTT
+         * with jitter; the old 10 s timeout treated ordinary stalls as dead. */
+        .network.timeout_ms = 20000,
     };
     s_mqtt = esp_mqtt_client_init(&cfg);
     esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -233,6 +295,11 @@ esp_err_t wifi_mqtt_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* Keep the radio awake. The default modem-sleep (WIFI_PS_MIN_MODEM) lets
+     * the PHY nap between beacons, which on a high-latency overseas broker
+     * (emqx.io, ~300 ms RTT) stalls TCP reads just long enough to trip
+     * esp-mqtt's "Network timeout while reading" and drop every ~20 s. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     state_led_set(LED_STATE_CONNECTING);
     lcd_vt_set_status(LCD_ST_CONNECTING, NULL);

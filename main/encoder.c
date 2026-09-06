@@ -62,6 +62,15 @@ static void encoder_add(int gpio_a, int gpio_b, pcnt_unit_handle_t *ret_unit)
     gpio_set_pull_mode(gpio_a, GPIO_PULLUP_ONLY);
     gpio_set_pull_mode(gpio_b, GPIO_PULLUP_ONLY);
 
+    // Reject sub-microsecond bounce on the quadrature lines. First line against
+    // electrical chatter; slower contact jitter is caught by software detent
+    // filtering in input_map, which this window cannot reach.
+    pcnt_glitch_filter_config_t glitch = { .max_glitch_ns = 1000 };
+    esp_err_t gerr = pcnt_unit_set_glitch_filter(unit, &glitch);
+    if (gerr != ESP_OK) {
+        ESP_LOGW(TAG, "glitch filter not applied: %s", esp_err_to_name(gerr));
+    }
+
     ESP_ERROR_CHECK(pcnt_unit_enable(unit));
     ESP_ERROR_CHECK(pcnt_unit_clear_count(unit));
     ESP_ERROR_CHECK(pcnt_unit_start(unit));

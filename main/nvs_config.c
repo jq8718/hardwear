@@ -12,7 +12,7 @@
 
 #define DEFAULT_SSID   "360WiFi-91868"
 #define DEFAULT_PASS   "18602191868"
-#define DEFAULT_BROKER "mqtt://broker.emqx.io:1883"
+#define DEFAULT_BROKER "mqtt://192.168.1.15:1883"
 
 static char s_ssid[64];
 static char s_pass[64];

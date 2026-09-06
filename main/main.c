@@ -13,6 +13,7 @@
 #include "input_map.h"
 #include "lcd_vt.h"
 #include "power_mgmt.h"
+#include "screen_jpeg.h"
 #include "state_led.h"
 #include "st7789.h"
 #include "wifi_mqtt.h"
@@ -75,6 +76,7 @@ void app_main(void)
     ESP_ERROR_CHECK(i2c_io_init());
     ESP_ERROR_CHECK(audio_init());
     ESP_ERROR_CHECK(input_map_init());
+    screen_jpeg_init();
     ESP_ERROR_CHECK(wifi_mqtt_init());
     power_mgmt_init();
     lcd_vt_init();
@@ -87,6 +89,9 @@ void app_main(void)
         state_led_tick();
         input_map_tick();
         lcd_vt_poll();
+        if (lcd_vt_pixels_mode()) {
+            screen_jpeg_poll();
+        }
 
         bool user_active = false;
         for (int i = 0; i < ENC_COUNT; i++) {
