@@ -1,7 +1,7 @@
 # VibeKey C5 最终板硬件方案（ESP32-C5 + vibetty + PDM 双麦立体声 + PCA9535CPW）
 
 > 最终引脚与实现方案（无历史变更记录，仅保留最终结果）。  
-> PDM 播放为**单声道输出**：`DOUT=GPIO15`，`GPIO25` 保留未用（见 6.3）。
+> PDM 仅做**双麦录音（RX）**，无播放输出；GPIO15 为 PSRAM CS1，不可用（见 6.3 / 注意事项 3）。
 
 ## 1. 最终引脚分配总表
 
@@ -20,11 +20,10 @@
 | 编码器1 A/B | ENC1_A / ENC1_B | **GPIO0 / GPIO1** | PCNT **Unit0**，4 倍频；Strapping 脚，见注意事项 1 |
 | 编码器2 A/B | ENC2_A / ENC2_B | **GPIO4 / GPIO5** | PCNT **Unit1** |
 | 编码器3 A/B | ENC3_A / ENC3_B | **GPIO11 / GPIO12** | PCNT **Unit2**；UART0 默认脚，见注意事项 2 |
-| PDM_CLK | BCK | **GPIO24** | PDM 时钟，MIC 录音与播放**共用** |
+| PDM_CLK | BCK | **GPIO24** | PDM 时钟，双麦录音用 |
 | PDM_DIN | 麦克风数据输入 | **GPIO23** | 双麦 DATA 并联，立体声输入 |
-| PDM_DOUT | 播放输出（单声道） | **GPIO15** | 接 PDM 功放；**需确认非 PSRAM 占用** |
 | USB D- / D+ | USB Serial/JTAG | **GPIO13 / GPIO14** | 仅烧录/日志/供电；ESP32-C5 不能做 USB HID |
-| 保留/未用 | - | PCNT **Unit3**、GPIO16~22（含 19/20）、**GPIO25**、**GPIO29**、GPIO30 等 | GPIO28 已作 INT，GPIO15 已作 DOUT（单声道） |
+| 保留/未用 | - | PCNT **Unit3**、GPIO16~22（含 19/20）、**GPIO25** 等 | GPIO28 已作 INT；GPIO15 为 PSRAM CS1 不可用 |
 
 > ESP32-C5 的数字外设（除 USB 外）均可经 **GPIO Matrix** 映射到任意 GPIO；上表为最终物理连接。
 
@@ -118,11 +117,11 @@
 
 ---
 
-## 6. PDM 双麦录音与单声道播放
+## 6. PDM 双麦录音（RX）
 
 ### 6.1 最终 IO 占用
-- **共 3 个 IO**：**GPIO24（PDM_CLK）、GPIO23（PDM_DIN）、GPIO15（PDM_DOUT，单声道）**。
-- RX（2 麦录音）与 TX（单声道播放）**全双工同时工作**，共享 `CLK=GPIO24`。
+- **共 2 个 IO**：**GPIO24（PDM_CLK）、GPIO23（PDM_DIN）**。
+- 仅 RX（2 麦录音），无 TX 播放。
 
 ### 6.2 麦克风连接（双麦立体声输入）
 
@@ -137,12 +136,10 @@
 - 单根 PDM 数据线最多承载 **2 个麦克风**（左右声道）；本方案为双麦立体声输入。
 - 若未来需 4 麦，必须弃用 PDM，改用 **ES7210 + TDM** 方案。
 
-### 6.3 PDM 播放（单声道输出）
-- `DOUT = GPIO15`：PCM-to-PDM TX 输出，接 PDM 功放（**单声道**）。
-- ESP-IDF 的 I2S PDM TX 只有单个 `data_out_num`（一条 dout 线），故采用**单声道输出**（原「双 dout 立体声」方案已放弃）。
-- 固件配置：`I2S_SLOT_MODE_MONO`（单 dout 输出单声道）。
-- `GPIO25` **不接、留作保留**（不再作 DOUT2）。
-- **限制**：PDM 模式下**不能同时接标准 I2S/TDM DAC（如 ES8311）**。若需高音质 I2S 耳机/DAC 播放，必须放弃 PDM 麦克风，改用 ES7210 TDM RX + DAC TX（全双工 TDM 方案）。
+### 6.3 无播放输出（已放弃 PDM TX）
+- 本方案**不做 PDM 播放**（喇叭/提示音不接），PDM 仅保留双麦录音 RX。
+- GPIO15 原计划作 PDM_DOUT，但已确认 **GPIO15 = PSRAM CS1（SPICS1）**，启用 PSRAM 时不可作 GPIO（见注意事项 3）。
+- ESP32-C5 的 PDM 全双工 TX 与 RX 时钟不兼容（实测会 CPU_LOCKUP），故彻底放弃 TX。
 
 ---
 
@@ -170,10 +167,10 @@
    - I2C 主机：初始化 **SDA=GPIO2、SCL=GPIO3**（内部上拉兜底）；探测 PCA9535CPW(0x20)——**无 ACK 则跳过按键/SW/INT，继续运行**；有 ACK 则写配置命令 `0x06` 发 `0xFF 0xFF`（全输入），配置 **GPIO28** 为 INT 中断（下降沿，内部上拉兜底）。
    - PCNT：初始化 **Unit0（GPIO0/1）、Unit1（GPIO4/5）、Unit2（GPIO11/12）**，全部配置为 **4 倍频正交计数**；定时/中断读取增量。
    - RMT TX：初始化 **GPIO27**，注册 WS2812 灯带。
-   - I2S PDM：配置 `bclk=GPIO24`、`din=GPIO23`、`dout=GPIO15`、`ws=-1`（PDM 不用 WS）。  
-     - RX：`I2S_SLOT_MODE_STEREO`（双麦输入）。  
-     - TX：`I2S_SLOT_MODE_MONO`（单声道输出）。  
-     - 采样率 16kHz，通过 GDMA 搬运；RX/TX 全双工同时 enable。
+   - I2S PDM：配置 `bclk=GPIO24`、`din=GPIO23`、`ws=-1`（PDM 不用 WS）；**仅 RX，无 TX**。  
+     - RX：`I2S_SLOT_MODE_STEREO` + raw PDM（双麦输入，2.048MHz 过采样）。  
+     - 无 TX（播放已放弃）。  
+     - 采样率 2.048MHz（raw PDM），GDMA 搬运，软件降采样到 16kHz PCM。
    - Wi-Fi STA + MQTT：连接运行 vibetty 的 PC 所在局域网，按 **vibetty 0.4.0+** 协议连接 broker（内置 `mqtt://<PC_IP>:1883` 或外部 broker）。
 2. **vibetty 状态显示**
    - 订阅 `+/+/+/vibetty` 发现实例 → 解析 presence 拿 `prefix`/`format` → 按 `format` 订 `{p}/screen_text`（text）或 `{p}/screen`（JPEG）→ 发 `sync` 拿首帧。
@@ -187,7 +184,6 @@
    - **文本 / 命令** → 发布到 `{p}/control`（JSON `{"type":"input_text","data":"..."}`，QoS1）；`--auto-submit`（默认 true）只对 `input_text` 生效，自动补回车执行。
 4. **语音旁路（自定义扩展，非 vibetty 协议）**
    - vibetty 0.4.0 已移除服务端 ASR，且 ESP32-C5 无法本地跑 Whisper；识别走**自定义旁路**：Voice 键按下 → I2S PDM 从 `DIN=GPIO23` 采集双麦 PCM（16kHz/16bit）→ 经自定义 MQTT topic / TCP / WebSocket 送**自建** PC 端 ASR（Whisper.cpp server）。
-   - 若需本地提示音，I2S PDM TX 从 `DOUT=GPIO15` 输出单声道 PDM 音频到功放。
    - ASR 文本 → 作为 `input_text` 经 `{p}/control` 发回 vibetty，注入终端，实现语音输入。
 5. **低功耗 / Remap / OTA**
    - 空闲 Deep-sleep；PCA9535 INT（**GPIO28**）或编码器活动唤醒。
@@ -202,12 +198,12 @@
    - 固件中 PCNT **不会自动配置内部上下拉**，必须显式调用 `gpio_set_pull_mode()` / `gpio_pullup_en()` / `gpio_pulldown_en()` 处理；
    - GPIO0/GPIO1 可通过 **GPIO Matrix** 路由到 PCNT，功能正常。
 2. **GPIO11 / GPIO12 是 UART0 默认脚（U0TXD / U0RXD）**：用作编码器3 的 A/B 时，必须在 menuconfig 中**关闭 UART0 console**，将系统日志/console 输出改为 **USB Serial/JTAG（GPIO13/14）** 或 None；否则 UART0 会占用这两个脚并与 PCNT 计数冲突，启动日志还会干扰编码器。
-3. **GPIO15 与 PSRAM 冲突确认**：ESP32-C5 部分模组（带封装内 PSRAM）会将 **GPIO15 用作 SPI PSRAM 的片选 SPICS1**；此时 GPIO15 不能作为 PDM_DOUT。你的模组已实测 GPIO6~10 可用于 LCD，但仍需单独确认 GPIO15 未连接 PSRAM；若 GPIO15 被占用，请把 `PDM_DOUT` 改到保留的 **GPIO29**，并在固件 `i2s` 配置中同步修改 `dout` 引脚。
-4. **PDM 音频能力**：
+3. **GPIO15 是 PSRAM CS1（已实测确认）**：ESP32-C5 的 `MSPI_IOMUX_PIN_NUM_CS1 = 15`，启用 PSRAM 时 GPIO15 固定作 SPI PSRAM 片选，**不可作 GPIO**。本方案已放弃 PDM 播放输出（原 DOUT=GPIO15 会破坏 PSRAM 导致崩溃）。
+4. **PDM 音频能力（仅 RX）**：
    - `DIN=GPIO23` 接 2 个 MIC，L/R 硬连线，**RX 为立体声输入（2 通道）**。
-   - TX 播放：**单声道输出**（`I2S_SLOT_MODE_MONO`），只走 `DOUT=GPIO15`。
-   - RX（2 麦录音）与 TX（单声道播放）共享 `CLK=GPIO24`，可全双工同时运行。
-   - **PDM 播放仅能驱动 PDM 器件**，不能同时接标准 I2S DAC（ES8311）；PDM 双麦最多 2 个，不能接 4 麦（4 麦需 ES7210 TDM 方案）。
+   - ESP32-C5 的 PDM RX 为 **raw 模式**（无硬件 PDM2PCM），过采样率 ~2.048MHz，需软件降采样到 16kHz PCM。
+   - 双麦最多 2 个；若需 4 麦需 ES7210 TDM 方案。
+   - **无 PDM 播放输出**（GPIO15 为 PSRAM CS1，且全双工 TX 时钟冲突，已放弃）。
 5. **PCA9535CPW 是开漏 C 版本（当前未焊接）**：6 个按键 + 3 个 SW 输入脚必须各接 **10k 上拉到 3.3V**，另一端接地；绝对不能悬空；**INT（GPIO28）也需外部上拉**；I2C 的 SDA/SCL（GPIO2/3）也需上拉。固件必须**先探测 0x20**，未焊接（无 ACK）时跳过按键/SW，仅靠编码器 A/B 运行；GPIO2/3/28 固件启用**内部上拉**兜底（见 4.4）。
 6. **LCD 的 GPIO6~GPIO10 以你的模组实测为准**：当前已验证可用；若更换模组、启用封装内 PSRAM 或更改启动配置，需重新验证这些脚是否与内部 Flash/PSRAM 冲突。
 7. **vibetty 协议与链路**：
@@ -225,7 +221,7 @@
 - **灯效**：RMT 驱动 WS2812，`GPIO27`。  
 - **I/O 扩展**：PCA9535CPW 挂 I2C（`SDA=GPIO2`、`SCL=GPIO3`，地址 `0x20`），扩展 6 个 Clicky 键 + 3 个编码器 SW；中断 `INT=GPIO28`。  
 - **输入**：3 个编码器直连 PCNT —— `GPIO0/1`（Unit0）、`GPIO4/5`（Unit1）、`GPIO11/12`（Unit2），硬件 4 倍频；保留 Unit3。  
-- **音频**：PDM 双麦立体声输入 `CLK=GPIO24`、`DIN=GPIO23`；PDM **单声道**播放 `DOUT=GPIO15`，RX/TX 全双工共用 `GPIO24` 时钟。  
+- **音频**：PDM 双麦立体声输入 `CLK=GPIO24`、`DIN=GPIO23`；PDM 双麦立体声录音 `CLK=GPIO24`、`DIN=GPIO23`（仅 RX，无播放输出）。  
 - **控制链路**：通过 **vibetty over MQTT** 与 PC 上的 `claude`/`codex` 终端通信；设备回传 keystrokes 控制 AI Agent，PDM 麦克风音频旁路送 PC ASR，LCD + RMT 显示/提示状态，完整实现 AI 编码物理控制面。
 
 ---

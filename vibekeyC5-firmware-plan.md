@@ -23,7 +23,7 @@ main/
   st7789.c/.h             # 已存在（LCD + 文本渲染），按需加 ANSI 简易渲染
   ws2812_encoder.c/.h     # 已存在（RMT 编码器）
   + i2c_io.c/.h           # I2C 主机 + PCA9535 探测/读取/优雅降级
-  + audio.c/.h            # I2S PDM RX(双麦)/TX(单声道)
+  + audio.c/.h            # I2S PDM RX(双麦录音)
   + wifi_mqtt.c/.h        # Wi-Fi STA + MQTT client + vibetty 0.4.0+ 协议
   + input_map.c/.h        # 编码器/按键 → keystrokes / 命令 映射
   + state_led.c/.h        # RMT 状态灯（waiting/working/error/yolo）
@@ -57,14 +57,14 @@ CMakeLists `PRIV_REQUIRES` 需新增：`esp_driver_i2c`、`esp_driver_i2s`、`es
 - **main.c**：主循环按当前 vibetty `state`（presence）+ 连接状态驱动灯，去掉固定彩虹。
 - **验收**：连接中/已连/断开/working/waiting 五态灯效正确。
 
-### 阶段 4：PDM 音频（双麦 RX + 单声道 TX，全双工）
-- **目标**：I2S PDM 全双工，`bclk=GPIO24`、`din=GPIO23`（RX 双麦立体声）、`dout=GPIO15`（TX 单声道）。
+### 阶段 4：PDM 双麦录音（仅 RX）
+- **目标**：I2S PDM RX，`bclk=GPIO24`、`din=GPIO23`，双麦立体声输入。
 - **audio.c**：
-  - I2S PDM 通道：RX `I2S_SLOT_MODE_STEREO`（2 麦），TX `I2S_SLOT_MODE_MONO`（单声道）。
-  - 采样率 16kHz、16bit，GDMA 搬运；RX/TX 同时 enable（全双工）。
-  - 提供 `audio_capture_start/read()/stop()` 与 `audio_play(data)` 接口。
-- **注意**：GPIO15 需确认未被 PSRAM（SPICS1）占用（vibekeyC5.md 注意事项 3）。
-- **验收**：录音 buffer 能取到双麦 PCM；播放能输出单声道 PDM（若暂无功放，先用逻辑分析仪/示波器看 dout 波形）。
+  - I2S PDM RX：`I2S_SLOT_MODE_STEREO`（2 麦）+ raw PDM（C5 无硬件 PDM2PCM）。
+  - 过采样率 2.048MHz，GDMA 搬运，软件降采样到 16kHz PCM。
+  - 提供 `audio_capture_read()` 接口。
+- **无 TX 播放**：GPIO15 是 PSRAM CS1 不可用，且全双工 PDM TX 与 RX 时钟冲突（实测 CPU_LOCKUP），故放弃播放输出。
+- **验收**：录音 buffer 能取到双麦 raw PDM；无 MIC 时也能初始化不崩溃。
 
 ### 阶段 5：Wi-Fi + MQTT + vibetty 协议（核心）
 - **目标**：接入 vibetty 0.4.0+，实现发现/显示/输入闭环。
@@ -106,9 +106,9 @@ CMakeLists `PRIV_REQUIRES` 需新增：`esp_driver_i2c`、`esp_driver_i2s`、`es
 
 1. **GPIO0/1 Strapping**：编码器不得在上电时拉成错误启动电平；PCNT 不会自动配置上下拉，须显式 `gpio_set_pull_mode()`。
 2. **GPIO11/12 = UART0**：必须关 UART0 console 改 USB Serial/JTAG（阶段 1）。
-3. **GPIO15 PSRAM**：PDM_DOUT 前确认未接 PSRAM SPICS1；冲突则改 GPIO29。
+3. **GPIO15 = PSRAM CS1**：已实测确认（`MSPI_IOMUX_PIN_NUM_CS1=15`），不可作 GPIO；PDM 播放输出已放弃。
 4. **PCA9535 未焊接**：所有路径必须 `probe → 降级`，GPIO2/3/28 内部上拉兜底。
-5. **PDM 单声道**：TX 仅 `I2S_SLOT_MODE_MONO`，无 dout2；RX 双麦仍立体声。
+5. **PDM 仅 RX**：无 TX 播放；RX 为 raw 模式（2.048MHz 过采样），需软件降采样。
 6. **vibetty 协议**：固件必须 v0.4.0+；默认 `-q text`（`screen_text`）；`--auto-submit` 只对 `input_text` 生效。
 7. **工具链**：PowerShell + ESP-IDF 6.0，勿删 `build`，GCC/CMake/Ninja 版本须与缓存一致（见 vibekeyC5.md 第 10 节）。
 
@@ -117,7 +117,7 @@ CMakeLists `PRIV_REQUIRES` 需新增：`esp_driver_i2c`、`esp_driver_i2s`、`es
 | 里程碑 | 阶段 | 验收 |
 |---|---|---|
 | M1 基础外设 | 1–3 | 3 编码器 + 状态灯 + PCA9535 降级运行 |
-| M2 音频 | 4 | 双麦录音 + 单声道播放 |
+| M2 音频 | 4 | 双麦录音（RX） |
 | M3 接入 vibetty | 5 | 发现/显示/输入闭环 |
 | M4 完整控制面 | 6 | 旋钮+按键控制 claude/codex |
 | M5 语音（可选） | 7 | 语音→文本进终端 |

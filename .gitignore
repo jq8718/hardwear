@@ -2,6 +2,9 @@
 /build/
 sdkconfig.old
 
+# ESP-IDF managed components (fetched from registry by idf.py)
+/managed_components/
+
 # OS
 .DS_Store
 Thumbs.db
