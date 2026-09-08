@@ -89,7 +89,7 @@
 
 ### 4.4 PCA9535CPW 未焊接的兼容性（固件必须支持）
 - **当前 PCA9535CPW 尚未焊接**：固件必须**探测后优雅降级**——I2C 写 0x20 若无 ACK（器件不存在）即视为未焊接，跳过按键/SW 读取与 INT 配置，**设备仍可正常运行**（编码器 A/B 直连 ESP32 的 PCNT，不依赖 PCA9535）。
-- 未焊接时以下 ESP32 侧 IO 悬空，固件必须**启用内部上拉**兜底。按引脚域选 API：**GPIO2/3 是 RTC/LP 引脚**，须 `rtc_gpio_pullup_en()`（同 encoder.c `encoder_pullup()` 的做法；`gpio_set_pull_mode(GPIO_PULLUP_ONLY)` 对它们物理无效）；GPIO28 非 RTC，用 `gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY)`：
+- 未焊接时以下 ESP32 侧 IO 悬空，固件必须**启用内部上拉**兜底。按引脚域选 API（2026-09-08 实测修正）：**GPIO2/3 是 RTC/LP 引脚**，其物理上拉在 HP 域与 RTC 域各有一个，须**两个都启用**——`gpio_set_pull_mode(GPIO_PULLUP_ONLY)` 加 `rtc_gpio_pullup_en()`（同 encoder.c `encoder_pullup()` 的做法）；GPIO28 非 RTC，用 `gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY)`：
 
 | IO | 作用 | 未焊时的处理 |
 |---|---|---|
@@ -113,7 +113,7 @@
 - 3 个编码器共占用 **6 个 C5 GPIO**（0/1、4/5、11/12）。
 - 编码器 **A/B 必须直连 ESP32-C5**（走 PCNT，硬件 **4 倍频**正交计数）；**SW 只是普通按键，接 PCA9535CPW**。
 - ESP32-C5 有 4 个 PCNT Unit，本方案使用 Unit0~2，**保留 Unit3**。
-- A/B 相固件启用**内部上拉**，编码器公共端接 GND。上拉须按引脚域区分（2026-09-08 实测修复）：**GPIO0/1、GPIO4/5 是 RTC/LP 引脚，须 `rtc_gpio_pullup_en()`**（`gpio_set_pull_mode(GPIO_PULLUP_ONLY)` 对它们物理无效，会空闲悬空低电平、丢计数）；GPIO11/12 非 RTC，`GPIO_PULLUP_ONLY` 即可（见 encoder.c `encoder_pullup()`）。
+- A/B 相固件启用**内部上拉**，编码器公共端接 GND。RTC/LP 引脚（**GPIO0/1、GPIO4/5**）的物理上拉在 HP 域（`gpio_set_pull_mode` 写 IO_MUX）与 RTC 域（`rtc_gpio_pullup_en` 写 LP_IO_MUX）各有一个，须**两个都启用**（encoder.c `encoder_pullup()` 已做）；且 `rtc_gpio_deinit()` 会把引脚切到 HP 数字域并**关掉 LP_IO 时钟**，若不复开时钟，其后的 `rtc_gpio_pullup_en()` 会被静默丢弃、引脚再次悬空低电平（2026-09-08 实测回归根因），故 encoder_add() 在 deinit 后用 `io_mux_enable_lp_io_clock()` 复开时钟再使能上拉。2026-09-08 实测：三个编码器空闲电平均 1/1。GPIO11/12 非 RTC，`GPIO_PULLUP_ONLY` 即可（见 encoder.c `encoder_pullup()`）。
 
 ---
 
@@ -195,7 +195,7 @@
 
 1. **GPIO0 / GPIO1 是 Strapping 引脚**：上电/复位时其电平会被锁存用于决定启动模式（尤其 GPIO0 为低可能进入下载模式）。用作编码器 A/B 相时：
    - 外部电路/编码器不得在上电时把 GPIO0/GPIO1 拉成错误启动电平；
-   - 固件中 PCNT **不会自动配置内部上下拉**，必须显式启用；因 GPIO0/1 是 RTC 引脚，上拉走 `rtc_gpio_pullup_en()`（`gpio_set_pull_mode(GPIO_PULLUP_ONLY)` 只对非 RTC 引脚生效，见 encoder.c `encoder_pullup()`）；
+   - 固件中 PCNT **不会自动配置内部上下拉**，必须显式启用；GPIO0/1 是 RTC 引脚，物理上拉在 HP 域（`gpio_set_pull_mode`）与 RTC 域（`rtc_gpio_pullup_en`）各有一个，`encoder_pullup()` 对 RTC 引脚**两个都启用**（见 encoder.c `encoder_pullup()`）；
    - GPIO0/GPIO1 可通过 **GPIO Matrix** 路由到 PCNT，功能正常。
 2. **GPIO11 / GPIO12 是 UART0 默认脚（U0TXD / U0RXD）**：用作编码器3 的 A/B 时，必须在 menuconfig 中**关闭 UART0 console**，将系统日志/console 输出改为 **USB Serial/JTAG（GPIO13/14）** 或 None；否则 UART0 会占用这两个脚并与 PCNT 计数冲突，启动日志还会干扰编码器。
 3. **GPIO15 是 PSRAM CS1（已实测确认）**：ESP32-C5 的 `MSPI_IOMUX_PIN_NUM_CS1 = 15`，启用 PSRAM 时 GPIO15 固定作 SPI PSRAM 片选，**不可作 GPIO**。本方案已放弃 PDM 播放输出（原 DOUT=GPIO15 会破坏 PSRAM 导致崩溃）。

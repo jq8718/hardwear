@@ -2,6 +2,7 @@
 #include "driver/pulse_cnt.h"
 #include "driver/rtc_io.h"
 #include "esp_log.h"
+#include "esp_private/io_mux.h"
 #include "hal/pcnt_ll.h"
 
 #include "encoder.h"
@@ -29,22 +30,42 @@ static pcnt_unit_handle_t s_enc1_unit = NULL;
 static pcnt_unit_handle_t s_enc2_unit = NULL;
 static pcnt_unit_handle_t s_enc3_unit = NULL;
 
-/* ESP32-C5: GPIO0-6 are LP/RTC-domain pads whose physical pull-up is wired to
- * the RTC IO registers. The HP-side pull gpio_set_pull_mode() writes does not
- * hold them, so they float LOW at idle (scope: GPIO0/1/4/5 low, GPIO11/12 high).
- * A floating quadrature line reads slow/weak edges and drops counts (the left
- * knob lag). Use the LP pull on RTC pads, HP pull elsewhere. */
+/* Pad pull-up: once rtc_gpio_deinit() has handed an RTC pad (GPIO0-6) to the
+ * HP mux (probe: mux_sel=0), the standard HP IO_MUX pull gpio_set_pull_mode()
+ * DOES hold it - measured g0 floats 0->1 with HP pull enabled. The LP pull is
+ * applied as well so the pad still holds even if it ends up LP-controlled. */
 static void encoder_pullup(int gpio)
 {
+    gpio_set_pull_mode(gpio, GPIO_PULLUP_ONLY);
     if (rtc_gpio_is_valid_gpio(gpio)) {
         ESP_ERROR_CHECK(rtc_gpio_pullup_en(gpio));
-    } else {
-        gpio_set_pull_mode(gpio, GPIO_PULLUP_ONLY);
     }
+}
+
+/* GPIO0-6 can come out of reset held in the LP/RTC pad function, where the
+ * digital input path (GPIO matrix / PCNT) never sees the pad even though the
+ * pin physically toggles (scope shows quadrature, gpio_get_level stays 0).
+ * Observed on the right knob GPIO0/1. rtc_gpio_deinit() hands the pad to the
+ * HP digital mux so PCNT counts it, but it ALSO force-disables the LP_IO
+ * clock; with that clock gated the LP_IO_MUX pull register drops subsequent
+ * rtc_gpio_pullup_en() writes and those pins float low again (the 2026-09-08
+ * regression on GPIO4/5). Re-assert the clock for the pad (refcounted, so it
+ * stays on) before rtc_gpio_pullup_en() below runs. */
+static void encoder_rtc_to_digital(int gpio)
+{
+    ESP_ERROR_CHECK(rtc_gpio_deinit(gpio));
+    io_mux_enable_lp_io_clock(gpio, true);
 }
 
 static void encoder_add(int gpio_a, int gpio_b, pcnt_unit_handle_t *ret_unit)
 {
+    if (rtc_gpio_is_valid_gpio(gpio_a)) {
+        encoder_rtc_to_digital(gpio_a);
+    }
+    if (rtc_gpio_is_valid_gpio(gpio_b)) {
+        encoder_rtc_to_digital(gpio_b);
+    }
+
     pcnt_unit_handle_t unit = NULL;
     pcnt_unit_config_t unit_config = {
         .low_limit = ENC_LOW_LIMIT,
@@ -100,6 +121,15 @@ esp_err_t encoder_init(void)
     encoder_add(ENC3_GPIO_A, ENC3_GPIO_B, &s_enc3_unit);
     ESP_LOGI(TAG, "encoders ready: enc1 GPIO%d/%d, enc2 GPIO%d/%d, enc3 GPIO%d/%d",
              ENC1_GPIO_A, ENC1_GPIO_B, ENC2_GPIO_A, ENC2_GPIO_B, ENC3_GPIO_A, ENC3_GPIO_B);
+    /* Idle level check: with the internal pull alive, any phase the knob is
+     * NOT shorting reads HIGH. Left/mid knobs (enc2 GPIO4/5, enc3 GPIO11/12)
+     * should read 1/1 at rest; the right knob (enc1 GPIO0/1) parks with both
+     * phases closed, so 0/0 there is expected. A floating 0 on a pad the knob
+     * leaves open means the pull was lost (LP_IO clock gated on RTC pads). */
+    ESP_LOGI(TAG, "enc idle lv: enc1 %d/%d  enc2 %d/%d  enc3 %d/%d",
+             gpio_get_level(ENC1_GPIO_A), gpio_get_level(ENC1_GPIO_B),
+             gpio_get_level(ENC2_GPIO_A), gpio_get_level(ENC2_GPIO_B),
+             gpio_get_level(ENC3_GPIO_A), gpio_get_level(ENC3_GPIO_B));
     return ESP_OK;
 }
 
