@@ -1,5 +1,6 @@
 #include "driver/gpio.h"
 #include "driver/pulse_cnt.h"
+#include "driver/rtc_io.h"
 #include "esp_log.h"
 #include "hal/pcnt_ll.h"
 
@@ -27,6 +28,20 @@ static const char *TAG = "encoder";
 static pcnt_unit_handle_t s_enc1_unit = NULL;
 static pcnt_unit_handle_t s_enc2_unit = NULL;
 static pcnt_unit_handle_t s_enc3_unit = NULL;
+
+/* ESP32-C5: GPIO0-6 are LP/RTC-domain pads whose physical pull-up is wired to
+ * the RTC IO registers. The HP-side pull gpio_set_pull_mode() writes does not
+ * hold them, so they float LOW at idle (scope: GPIO0/1/4/5 low, GPIO11/12 high).
+ * A floating quadrature line reads slow/weak edges and drops counts (the left
+ * knob lag). Use the LP pull on RTC pads, HP pull elsewhere. */
+static void encoder_pullup(int gpio)
+{
+    if (rtc_gpio_is_valid_gpio(gpio)) {
+        ESP_ERROR_CHECK(rtc_gpio_pullup_en(gpio));
+    } else {
+        gpio_set_pull_mode(gpio, GPIO_PULLUP_ONLY);
+    }
+}
 
 static void encoder_add(int gpio_a, int gpio_b, pcnt_unit_handle_t *ret_unit)
 {
@@ -59,8 +74,8 @@ static void encoder_add(int gpio_a, int gpio_b, pcnt_unit_handle_t *ret_unit)
     ESP_ERROR_CHECK(pcnt_channel_set_level_action(chan_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
 
     // The PCNT driver only routes the signals; enable the internal pull-ups here.
-    gpio_set_pull_mode(gpio_a, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(gpio_b, GPIO_PULLUP_ONLY);
+    encoder_pullup(gpio_a);
+    encoder_pullup(gpio_b);
 
     // Reject sub-microsecond bounce on the quadrature lines. First line against
     // electrical chatter; slower contact jitter is caught by software detent

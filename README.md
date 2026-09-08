@@ -4,7 +4,7 @@
 
 1. **WS2812 彩灯**：`GPIO27` 通过 RMT 发送 GRB 数据，单颗 LED 以低亮度循环彩虹色。
 2. **ST7789 液晶**：4 线 SPI（40 MHz）驱动 172x320 的 LCD147，背光由 `GPIO26` 控制。
-3. **两个旋转编码器**：编码器 1（`GPIO0/1`）、编码器 2（`GPIO4/5`）用 PCNT 正交解码（4 倍频），16 位原始计数与 32 位累加计数实时显示在 LCD 上。
+3. **三个旋转编码器**：编码器 1（`GPIO0/1`）、编码器 2（`GPIO4/5`）、编码器 3（`GPIO11/12`）经 PCNT 正交解码（4 倍频），编码器 2/3 的增量经 [input_map.c](main/input_map.c) 映射为 LCD 回翻 / 合成滚轮事件。
 
 目录中的 `TFT-147-HSD-ST7789-4WSPI-STM32` 是 LCD 移植参考的 STM32F103 工程。
 
@@ -41,8 +41,9 @@
 |---|---|
 | 编码器 1 | A=GPIO0，B=GPIO1 |
 | 编码器 2 | A=GPIO4，B=GPIO5 |
+| 编码器 3 | A=GPIO11，B=GPIO12 |
 | 解码方式 | PCNT 正交解码，4 倍频 |
-| 内部上拉 | 已启用（GPIO_PULLUP_ONLY） |
+| 内部上拉 | RTC 引脚（GPIO0~6）→ rtc_gpio_pullup_en()；其余 → GPIO_PULLUP_ONLY |
 
 接线时将 WS2812 的 `DIN` 接到 GPIO27，并共地。WS2812 的供电电压按实际模块规格连接；首次测试建议使用较低亮度，避免单颗 LED 电流过大。
 
@@ -189,7 +190,7 @@ $env:Path = "C:\Espressif\tools\riscv32-esp-elf\esp-15.2.0_20251204\riscv32-esp-
 
 上面的直接烧录命令只适用于 `build` 中的镜像来自本次工程、目标芯片为 ESP32-C5 且 Flash 配置为 16 MB 的情况。修改 `sdkconfig`、切换目标芯片或更换 ESP-IDF 版本后，必须先执行一次 `set-target` 和完整 `build`。
 
-退出串口监视器使用 `Ctrl+]`。烧录完成并重启后，GPIO27 上的 WS2812 开始低亮度彩虹循环，LCD 点亮并显示两个编码器的 RAW/ACC 计数。
+退出串口监视器使用 `Ctrl+]`。烧录完成并重启后，GPIO27 上的状态灯亮起，LCD 点亮进入主界面，旋转编码器 2/3 即可回翻历史 / 滚轮操作。
 
 ## 编译验证
 
@@ -213,7 +214,7 @@ I (...) esp_psram: Found 8MB PSRAM device
 I (...) ws2812: Memory: internal free=..., PSRAM total=..., PSRAM free=...
 I (...) ws2812: WS2812 rainbow started on GPIO27
 I (...) st7789: ST7789 initialized, backlight on
-I (...) encoder: encoders ready: enc1 GPIO0/1, enc2 GPIO4/5
+I (...) encoder: encoders ready: enc1 GPIO0/1, enc2 GPIO4/5, enc3 GPIO11/12
 I (...) ws2812: LCD encoder display ready
 ```
 
@@ -239,13 +240,24 @@ LCD147 的有效区域为 `172x320`，ST7789 横向偏移为 `34`。LCD 驱动�
 
 ## 编码器参考接线
 
-两个旋转编码器通过 PCNT（脉冲计数器）正交解码驱动，A/B 相均启用内部上拉，旋转方向决定计数值增减，计数值实时显示在 LCD 上。
+三个旋转编码器通过 PCNT（脉冲计数器）正交解码驱动，旋转方向决定增量正负；增量经 [input_map.c](main/input_map.c) 的每定位格消抖后映射成按键序列，不再在 LCD 上显示 RAW/ACC 计数。
 
-| 编码器 | A 相 | B 相 |
-|---|---|---|
-| 编码器 1 | GPIO0 | GPIO1 |
-| 编码器 2 | GPIO4 | GPIO5 |
+| 编码器 | A 相 | B 相 | 物理位置 | 输入角色 |
+|---|---|---|---|---|
+| 编码器 1 | GPIO0 | GPIO1 | 右旋钮 | 备用（未映射） |
+| 编码器 2 | GPIO4 | GPIO5 | 左旋钮 | LCD 历史回翻（ESC[A/B） |
+| 编码器 3 | GPIO11 | GPIO12 | 中旋钮 | 合成鼠标滚轮（ESC[C/D） |
 
-- A/B 相内部上拉已启用（`GPIO_PULLUP_ONLY`），编码器公共端接 GND。
+- A/B 相内部上拉已启用，编码器公共端接 GND。上拉方式按引脚所属域区分，见下方「上拉坑」。
 - 每个编码器占用一个 PCNT 单元、两个通道做正交解码（`driver/pulse_cnt.h`），对 A/B 两相的 4 个跳变沿全部计数，即 4 倍频。PCNT 硬件计数寄存器为 16 位，回绕阈值 `low_limit/high_limit` 只能配置在 `-32768 ~ 32767`；开启 `accum_count` 后由中断做 32 位软件累加，`pcnt_unit_get_count()` 返回的累计值可达 32 位范围（约 ±21 亿），不会在 ±32767 处回绕。
-- LCD 上半区显示 `ENC1`（绿色标签）的 `RAW`（琥珀色，16 位原始计数）与 `ACC`（白色，32 位累加计数）；下半区显示 `ENC2`（青色标签）的 `RAW` 与 `ACC`，中间有分隔线。
+
+#### ESP32-C5：RTC/LP 引脚（GPIO0~6）的内部上拉坑（已修复）
+
+GPIO0~6 属于 **LP/RTC 域**，其物理上拉由 **RTC IO 寄存器**控制；但 ESP-IDF 对非 ESP32 芯片（含 C5）在 `gpio_pullup_en()` 中一律写 **HP（数字）域** IO_MUX 上拉位（`GPIO_RTCIO_ARE_INDEPENDENT=1`），因此对 GPIO0~6 调用 `gpio_set_pull_mode(GPIO_PULLUP_ONLY)` **并不生效**：引脚悬空（示波器看到空闲低电平），编码器边沿变慢、被 PCNT 1µs 滤波吞掉而丢计数——这正是左旋钮（GPIO4/5）滞后/缺日志、而中旋钮（GPIO11/12，非 RTC）灵敏的原因。
+
+固件 [encoder.c](main/encoder.c) 以 `encoder_pullup()` 按引脚域启用上拉：
+
+- RTC 引脚（`rtc_gpio_is_valid_gpio()` 为真，本工程 GPIO0/1、GPIO4/5）→ `rtc_gpio_pullup_en()`（写 LP 域寄存器）；
+- 非 RTC 引脚（GPIO11/12）→ `gpio_set_pull_mode(GPIO_PULLUP_ONLY)`。
+
+修复后（2026-09-08 实测）：GPIO4/5 空闲电平由 0 转 1，每定位格稳定吃到 4 个原始计数、无反转无丢失，与 GPIO11/12 完全一致。

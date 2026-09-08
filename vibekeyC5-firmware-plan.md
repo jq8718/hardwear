@@ -8,7 +8,7 @@
 |---|---|---|
 | WS2812 | GPIO27 RMT 驱动，单颗彩虹循环 | [main.c](main/main.c)、[ws2812_encoder.c](main/ws2812_encoder.c) |
 | LCD | ST7789 4 线 SPI（40MHz，172x320），文本渲染 + 背光 GPIO26 | [st7789.c](main/st7789.c) |
-| 编码器 | 2 路 PCNT 4 倍频（GPIO0/1、4/5），内部上拉已配 | [encoder.c](main/encoder.c) |
+| 编码器 | 3 路 PCNT 4 倍频（GPIO0/1、4/5、11/12），内部上拉已配（0~6 走 LP 域） | [encoder.c](main/encoder.c) |
 | 编译 | ESP-IDF 6.0，`project(esp32c5_lcd147)` | [CMakeLists.txt](CMakeLists.txt) |
 
 尚未实现：编码器3、I2C/PCA9535、按键、INT 中断、PDM 音频、Wi-Fi、MQTT、vibetty 协议、输入映射、状态灯。
@@ -94,6 +94,7 @@ CMakeLists `PRIV_REQUIRES` 需新增：`esp_driver_i2c`、`esp_driver_i2s`、`es
   - 文本/命令走 `control` 的 `input_text`；单键/转义序列走 `pty_in`。
 - **状态机**：BOOT → WIFI → MQTT → DISCOVER → READY → RECONNECT（参考 vibetty-main 计划的状态机）。
 - **验收**：旋转/按键能控制 PC 上的 claude/codex 终端。
+- **状态（2026-09-08 实测）**：✅ **左旋钮（GPIO4/5）滞后/丢计数 = RTC 引脚内部上拉失效**。CH1（GPIO4/5）与 CH2（GPIO11/12）的固件配置逐字节相同，差异只在引脚归属域：GPIO0~6 是 **LP/RTC 域**引脚，而 `gpio_pullup_en()` 对非 ESP32 芯片一律写 HP 侧上拉（`GPIO_RTCIO_ARE_INDEPENDENT=1`），对 RTC 引脚物理无效 → 空闲悬空低电平（示波器：GPIO0/1/4/5 低、GPIO11/12 高），弱边沿被 PCNT glitch 滤波吞掉 → 每格计数不齐/滞后。修复：encoder.c 新增 `encoder_pullup()`——RTC 引脚（GPIO0/1、4/5）走 `rtc_gpio_pullup_en()`，GPIO11/12 走 `GPIO_PULLUP_ONLY`。实测 GPIO4/5 空闲由 0 转 1，每定位格恰好 4 个原始计数、无反转无丢失，与 CH2 一致。同坑适用于 I2C 的 GPIO2/3（同为 RTC 引脚）。
 
 ### 阶段 7：语音旁路（可选，自定义扩展）
 - **目标**：Voice 键 → PDM 采集 → 送自建 PC ASR → 文本回注 vibetty。
@@ -119,7 +120,7 @@ CMakeLists `PRIV_REQUIRES` 需新增：`esp_driver_i2c`、`esp_driver_i2s`、`es
 
 ## 3. 关键风险与约束
 
-1. **GPIO0/1 Strapping**：编码器不得在上电时拉成错误启动电平；PCNT 不会自动配置上下拉，须显式 `gpio_set_pull_mode()`。
+1. **GPIO0/1 Strapping**：编码器不得在上电时拉成错误启动电平；PCNT 不会自动配置上下拉，须显式启用。注意 C5 的 **GPIO0~6 是 RTC/LP 域引脚**，其内部上拉须走 `rtc_gpio_pullup_en()`（encoder.c `encoder_pullup()` 已处理），`gpio_set_pull_mode(GPIO_PULLUP_ONLY)` 只对非 RTC 引脚（如 GPIO11/12）生效。
 2. **GPIO11/12 = UART0**：必须关 UART0 console 改 USB Serial/JTAG（阶段 1）。
 3. **GPIO15 = PSRAM CS1**：已实测确认（`MSPI_IOMUX_PIN_NUM_CS1=15`），不可作 GPIO；PDM 播放输出已放弃。
 4. **PCA9535 未焊接**：所有路径必须 `probe → 降级`，GPIO2/3/28 内部上拉兜底。
