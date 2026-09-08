@@ -20,6 +20,7 @@ const char *nvs_config_target_prefix(void);   /* "" when unset */
 bool nvs_config_broker_stored(void);          /* explicit 'broker' saved? */
 
 esp_err_t nvs_config_init(void);
+esp_err_t nvs_config_save_broker(const char *uri);
 esp_err_t nvs_config_save_target_prefix(const char *prefix);
 
 #ifdef __cplusplus

@@ -80,6 +80,30 @@ const char *nvs_config_target_prefix(void)   { return s_prefix; }
  * default), so wifi_mqtt can promote it ahead of the per-network candidates. */
 bool nvs_config_broker_stored(void)          { return s_broker_stored; }
 
+esp_err_t nvs_config_save_broker(const char *uri)
+{
+    if (!uri) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    strncpy(s_broker, uri, sizeof(s_broker) - 1);
+    s_broker[sizeof(s_broker) - 1] = 0;
+    s_broker_stored = true;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = nvs_set_str(h, "broker", s_broker);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    ESP_LOGI(TAG, "broker %s%s", s_broker, err == ESP_OK ? " saved" : " FAILED");
+    return err;
+}
+
 esp_err_t nvs_config_save_target_prefix(const char *prefix)
 {
     if (!prefix) {

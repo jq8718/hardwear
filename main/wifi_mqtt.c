@@ -8,6 +8,9 @@
 #include "esp_timer.h"
 #include "mqtt_client.h"
 #include "cJSON.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include "lwip/inet.h"
 
 #include "wifi_mqtt.h"
 #include "state_led.h"
@@ -46,6 +49,15 @@
 #define BROKER_OFFICE_URI   "mqtt://192.168.1.15:1883"
 #define BROKER_HOTSPOT_URI  "mqtt://192.168.43.125:1883"
 
+/* UDP broker discovery. The PC's mosquitto has a DHCP address that changes on
+ * reboot, so before connecting we broadcast a request on the current subnet and
+ * let the PC relay reply with the broker address it can actually route to us.
+ * Protocol (relay side: build/real/vibecode_relay.py, DISC_PORT): */
+#define DISC_PORT       41793
+#define DISC_REQ        "VIBEKEY-DISC\n"
+#define DISC_RES_PFX    "VIBEKEY-BROKER "
+#define DISC_PROBE_MS   20000   /* while up but broker down, re-probe every 20 s */
+
 static const char *TAG = "wifi_mqtt";
 
 static esp_mqtt_client_handle_t s_mqtt = NULL;
@@ -56,7 +68,11 @@ static char s_prefix[128] = {0};
 static int  s_ap_cur = 0;             /* 0 = primary, 1 = fallback */
 static bool s_wifi_up = false;        /* STA has an IP (net is usable) */
 static char s_ap_ssid[33] = {0};      /* ssid of the AP we last configured */
+static char s_own_ip[16] = {0};       /* dotted own IP from GOT_IP */
+static char s_disc_ip[40] = {0};      /* broker host learned by UDP discovery */
+static char s_disc_uri[128] = {0};    /* mqtt://<s_disc_ip>:1883 */
 static esp_timer_handle_t s_ap_timer = NULL;
+static esp_timer_handle_t s_probe_timer = NULL;
 
 /* Broker candidates in try order, rebuilt on each fresh association. */
 static const char *s_broker_cand[3];
@@ -342,12 +358,15 @@ static void broker_cands_add(const char *u)
     }
 }
 
-/* Broker try-list for the current association: an explicit stored NVS 'broker'
- * leads, then the current net's broker, then the other net's broker. */
+/* Broker try-list for the current association: the UDP-discovered address (this
+ * association, or the NVS cache from last time) leads, then the current net's
+ * broker, then the other net's broker. */
 static void broker_cands_build(void)
 {
     s_broker_n = 0;
-    if (nvs_config_broker_stored()) {
+    if (s_disc_uri[0]) {
+        broker_cands_add(s_disc_uri);
+    } else if (nvs_config_broker_stored()) {
         broker_cands_add(nvs_config_broker_uri());
     }
     bool hotspot = strcmp(s_ap_ssid, AP_HOTSPOT_SSID) == 0;
@@ -364,6 +383,108 @@ static void mqtt_failover_do(void *arg)
     (void) arg;
     mqtt_stop();
     mqtt_start();
+}
+
+/* UDP broker discovery: ask the local subnet "who carries the vibetty broker?"
+ * and take the first valid reply. The PC relay answers with the address it can
+ * route to us, so this survives any DHCP churn on the PC. Blocking (bounded to
+ * ~1 s only when no responder exists; replies normally arrive in ms). */
+static bool broker_disc_learn(void)
+{
+    if (!s_own_ip[0]) {
+        return false;
+    }
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "discovery: socket failed");
+        return false;
+    }
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 250000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    /* Send to both the limited and the /24 subnet-directed broadcast so the
+     * query survives APs that only forward one of the two forms. */
+    int a, b, c, d;
+    if (sscanf(s_own_ip, "%d.%d.%d.%d", &a, &b, &c, &d) != 4) {
+        a = 0; b = 0; c = 0; d = 0;
+    }
+    char directed[16];
+    snprintf(directed, sizeof(directed), "%d.%d.%d.255", a, b, c);
+    const char *targets[2] = { "255.255.255.255", directed };
+
+    struct sockaddr_in dst = {0};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(DISC_PORT);
+    for (int i = 0; i < 2; i++) {
+        dst.sin_addr.s_addr = inet_addr(targets[i]);
+        sendto(fd, DISC_REQ, strlen(DISC_REQ), 0, (struct sockaddr *) &dst, sizeof(dst));
+    }
+
+    char ip[40] = {0};
+    char buf[128];
+    bool got = false;
+    for (int i = 0; i < 4 && !got; i++) {
+        struct sockaddr_in from;
+        socklen_t fromlen = sizeof(from);
+        int n = recvfrom(fd, buf, sizeof(buf) - 1, 0, (struct sockaddr *) &from, &fromlen);
+        if (n <= 0) {
+            continue;
+        }
+        buf[n] = 0;
+        if (strncmp(buf, DISC_RES_PFX, strlen(DISC_RES_PFX)) != 0) {
+            continue;
+        }
+        const char *p = buf + strlen(DISC_RES_PFX);
+        int j = 0;
+        while (j < (int) sizeof(ip) - 1 && p[j] && p[j] != ' ' && p[j] != '\n' && p[j] != '\r') {
+            ip[j] = p[j];
+            j++;
+        }
+        ip[j] = 0;
+        int x1, x2, x3, x4;
+        if (sscanf(ip, "%d.%d.%d.%d", &x1, &x2, &x3, &x4) == 4 &&
+            x1 >= 0 && x1 <= 255 && x2 >= 0 && x2 <= 255 &&
+            x3 >= 0 && x3 <= 255 && x4 >= 0 && x4 <= 255) {
+            got = true;
+        }
+    }
+    close(fd);
+    if (!got || !ip[0]) {
+        return false;
+    }
+    strncpy(s_disc_ip, ip, sizeof(s_disc_ip) - 1);
+    s_disc_ip[sizeof(s_disc_ip) - 1] = 0;
+    snprintf(s_disc_uri, sizeof(s_disc_uri), "mqtt://%s:1883", s_disc_ip);
+    ESP_LOGI(TAG, "broker discovery -> %s", s_disc_uri);
+    if (strcmp(nvs_config_broker_uri(), s_disc_uri) != 0) {
+        nvs_config_save_broker(s_disc_uri);
+    }
+    return true;
+}
+
+/* Periodic re-probe: WiFi is up but the broker is unreachable. The PC's IP may
+ * have changed while the device stayed associated (PC reboot), so re-run
+ * discovery; only reconnect when the learned host actually differs. */
+static void broker_probe_tick(void *arg)
+{
+    (void) arg;
+    if (!s_wifi_up || s_mqtt_connected) {
+        return;
+    }
+    char before[40];
+    strncpy(before, s_disc_ip, sizeof(before) - 1);
+    before[sizeof(before) - 1] = 0;
+    if (!broker_disc_learn()) {
+        return;
+    }
+    if (strcmp(before, s_disc_ip) != 0) {
+        ESP_LOGW(TAG, "broker host %s -> %s, reconnecting", before, s_disc_ip);
+        mqtt_stop();
+        broker_cands_build();
+        mqtt_start();
+    }
 }
 
 static void wifi_ap_set(int ap)
@@ -435,6 +556,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ESP_LOGI(TAG, "got IP " IPSTR " (ssid=%s ap=%d)",
                  IP2STR(&ev->ip_info.ip), s_ap_ssid, s_ap_cur);
         s_wifi_up = true;
+        snprintf(s_own_ip, sizeof(s_own_ip), IPSTR, IP2STR(&ev->ip_info.ip));
+        broker_disc_learn();
         broker_cands_build();
         mqtt_start();
     }
@@ -471,6 +594,9 @@ esp_err_t wifi_mqtt_init(void)
     }
     esp_timer_create_args_t ftargs = { .callback = mqtt_failover_do, .name = "mqtt_fail" };
     esp_timer_create(&ftargs, &s_fail_timer);
+    esp_timer_create_args_t ptargs = { .callback = broker_probe_tick, .name = "brk_probe" };
+    esp_timer_create(&ptargs, &s_probe_timer);
+    esp_timer_start_periodic(s_probe_timer, DISC_PROBE_MS * 1000);
 
     state_led_set(LED_STATE_CONNECTING);
     lcd_vt_set_status(LCD_ST_CONNECTING, NULL);
